@@ -11,6 +11,7 @@ from pipecat.pipeline.task import PipelineTask
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.server import WebsocketServerTransport
 from app.mcp_service import HomeAssistantMCPService
+from app.mcp_error_reporting import install as install_mcp_error_reporting
 from app.phase_emitter import TURN_LIVENESS
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
@@ -690,6 +691,16 @@ class Application:
                 try:
                     await self.mcp_client.register_tools_schema(mcp_tools_schema, self.openai_service)
                     logger.info(f"✅ Registered {len(mcp_tools_schema.standard_tools)} MCP tool handlers")
+                    # Pipecat logs every call that returned text as "completed
+                    # successfully", including hard failures, and hands the raw
+                    # traceback fragment to the model. Wrap the handlers so a
+                    # failed tool is visible in the log and unambiguous to the
+                    # model. See app/mcp_error_reporting.py.
+                    wrapped = install_mcp_error_reporting(
+                        self.openai_service,
+                        [s.name for s in mcp_tools_schema.standard_tools],
+                    )
+                    logger.info(f"✅ Error reporting wrapped {wrapped} MCP tool handlers")
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to register MCP tool handlers: {e}")
             

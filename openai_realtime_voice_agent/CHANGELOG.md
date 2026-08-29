@@ -2,6 +2,16 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.6.1
+
+**Failed tool calls are now reported as failures**
+
+- When a Home Assistant tool call failed, the log said the tool "completed
+  successfully" and the assistant was handed the raw Python error text. A broken
+  tool could therefore fail every time with nothing in the log to find it by.
+  Failures are now logged as failures, with the reason, and the assistant is told
+  plainly that the action did not run.
+
 ## 0.6.0
 
 > ⚠️ **This update has two parts — please update both:**
