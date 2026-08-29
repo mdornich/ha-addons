@@ -1,0 +1,12 @@
+{
+  "name": "Mitch's Home Assistant add-ons",
+  "url": "https://github.com/mdornich/ha-addons",
+  "maintainer": "mdornich",
+  "addons": [
+    {
+      "slug": "openai_realtime_voice_agent",
+      "name": "OpenAI Realtime 2 Voice Agent",
+      "version": "0.6.0"
+    }
+  ]
+}
