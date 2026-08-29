@@ -2,6 +2,14 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.6.2
+
+- Failure reporting now also catches Home Assistant's own "I don't know that
+  device" style answers and partly-failed actions, which previously logged as
+  clean successes, and an error that arrives after other output. A service that
+  ran and reported a problem is no longer described to the assistant as one that
+  never ran.
+
 ## 0.6.1
 
 **Failed tool calls are now reported as failures**

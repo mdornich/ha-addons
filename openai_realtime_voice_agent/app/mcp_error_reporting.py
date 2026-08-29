@@ -47,6 +47,45 @@ OK = "ok"
 TOOL_ERROR = "tool_error"  # hard failure: the call did not run
 PAYLOAD_ERROR = "payload_error"  # call ran, the service reported a problem
 
+MAX_DETAIL = 400
+
+
+def _trim(detail: Any) -> str:
+    return str(detail).strip()[:MAX_DETAIL]
+
+
+def _classify_payload(payload: dict) -> tuple[str, str | None]:
+    """Classify a decoded JSON body from the Home Assistant MCP server."""
+    # A script that stopped on an error puts it in `result.error` while
+    # `success` stays true.
+    result = payload.get("result")
+    if isinstance(result, dict) and result.get("error"):
+        return PAYLOAD_ERROR, _trim(result["error"])
+    # `success: false` means the service ran and reported a failure -- a payload
+    # error, not a hard failure. Telling the model the tool "did not run" would
+    # invite a retry of a call that will fail identically.
+    if payload.get("success") is False:
+        return PAYLOAD_ERROR, _trim(payload.get("error") or payload)
+    # Home Assistant's own intent responses. `response_type: "error"` is the
+    # everyday failure ("no valid targets" when a light name doesn't match), and
+    # an `action_done` with a non-empty `data.failed` is a partial failure.
+    # Neither carries the word "error" at the top level, so both used to log as
+    # a clean success -- the most common HA failure, invisible.
+    if payload.get("response_type") == "error":
+        data = payload.get("data")
+        code = data.get("code") if isinstance(data, dict) else None
+        speech = payload.get("speech")
+        spoken = None
+        if isinstance(speech, dict):
+            plain = speech.get("plain")
+            if isinstance(plain, dict):
+                spoken = plain.get("speech")
+        return PAYLOAD_ERROR, _trim(spoken or code or payload)
+    data = payload.get("data")
+    if isinstance(data, dict) and data.get("failed"):
+        return PAYLOAD_ERROR, _trim(f"failed targets: {data['failed']}")
+    return OK, None
+
 
 def classify_result(response: Any) -> tuple[str, str | None]:
     """Classify one MCP tool response.
@@ -65,24 +104,22 @@ def classify_result(response: Any) -> tuple[str, str | None]:
     if not text:
         return TOOL_ERROR, "empty response"
 
+    # Anywhere in the text, not just at the front: pipecat concatenates every
+    # content chunk into one string (`response += content.text`), so a tool that
+    # emits a good chunk 0 and an error chunk 1 would otherwise read as a clean
+    # success -- exactly the blindness this module exists to remove.
     for prefix in _PIPECAT_ERROR_PREFIXES:
-        if text.startswith(prefix):
-            return TOOL_ERROR, text
+        index = text.find(prefix)
+        if index != -1:
+            return TOOL_ERROR, _trim(text[index:])
 
-    # Home Assistant's MCP server answers with JSON; a script that stopped on an
-    # error puts it in `result.error` while `success` stays true.
     try:
         payload = json.loads(text)
     except (ValueError, TypeError):
         return OK, None
     if not isinstance(payload, dict):
         return OK, None
-    if payload.get("success") is False:
-        return TOOL_ERROR, str(payload.get("error") or payload)[:400]
-    result = payload.get("result")
-    if isinstance(result, dict) and result.get("error"):
-        return PAYLOAD_ERROR, str(result["error"])[:400]
-    return OK, None
+    return _classify_payload(payload)
 
 
 def describe_for_model(function_name: str, detail: str | None) -> str:
@@ -126,11 +163,27 @@ def install(llm_service, tool_names) -> int:
     allow-list must not take the session down.
     """
     wrapped = 0
-    registry = getattr(llm_service, "_functions", {})
+    tool_names = list(tool_names)
+    registry = getattr(llm_service, "_functions", None)
+    if registry is None:
+        # pipecat renamed the private registry: without this the wrap silently
+        # no-ops and the add-on reverts to logging failures as successes, with a
+        # green checkmark. Say so loudly instead.
+        logger.error(
+            "❌ MCP error reporting DISABLED: pipecat's function registry "
+            "(_functions) is missing -- failed tool calls will log as successes"
+        )
+        return 0
     for name in tool_names:
         item = registry.get(name)
         if item is None or getattr(item, "handler", None) is None:
             continue
         llm_service.register_function(name, wrap_handler(name, item.handler))
         wrapped += 1
+    if tool_names and not wrapped:
+        logger.error(
+            f"❌ MCP error reporting DISABLED: none of the {len(tool_names)} MCP "
+            "tools were found in pipecat's registry -- failed tool calls will "
+            "log as successes"
+        )
     return wrapped

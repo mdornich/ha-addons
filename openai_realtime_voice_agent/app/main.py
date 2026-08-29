@@ -691,18 +691,28 @@ class Application:
                 try:
                     await self.mcp_client.register_tools_schema(mcp_tools_schema, self.openai_service)
                     logger.info(f"✅ Registered {len(mcp_tools_schema.standard_tools)} MCP tool handlers")
-                    # Pipecat logs every call that returned text as "completed
-                    # successfully", including hard failures, and hands the raw
-                    # traceback fragment to the model. Wrap the handlers so a
-                    # failed tool is visible in the log and unambiguous to the
-                    # model. See app/mcp_error_reporting.py.
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to register MCP tool handlers: {e}")
+
+                # Pipecat logs every call that returned text as "completed
+                # successfully", including hard failures, and hands the raw
+                # traceback fragment to the model. Wrap the handlers so a failed
+                # tool is visible in the log and unambiguous to the model. See
+                # app/mcp_error_reporting.py. Its own try/except: registration
+                # above may well have succeeded, and reporting a registration
+                # failure for a wrapping failure would misdiagnose exactly the
+                # class of problem this code exists to make diagnosable.
+                try:
                     wrapped = install_mcp_error_reporting(
                         self.openai_service,
                         [s.name for s in mcp_tools_schema.standard_tools],
                     )
                     logger.info(f"✅ Error reporting wrapped {wrapped} MCP tool handlers")
                 except Exception as e:
-                    logger.warning(f"⚠️ Failed to register MCP tool handlers: {e}")
+                    logger.error(
+                        f"❌ MCP error reporting DISABLED ({e!r}) -- tools still work, "
+                        "but failed calls will log as successes"
+                    )
             
             # Register service with session manager
             if client_id:

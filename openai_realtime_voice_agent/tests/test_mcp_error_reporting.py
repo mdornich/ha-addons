@@ -65,10 +65,62 @@ def test_payload_error_is_reported_but_not_rewritten():
     assert "No Sonos favorite" in detail
 
 
-def test_explicit_success_false_is_a_tool_error():
-    outcome, detail = classify_result('{"success": false, "error": "nope"}')
+def test_explicit_success_false_is_a_payload_error_not_a_hard_failure():
+    """The service ran and reported a failure. Telling the model it "did not
+    run" invites a retry of a call that will fail identically."""
+    outcome, detail = classify_result(
+        '{"success": false, "error": "media_player.office is unavailable"}'
+    )
+    assert outcome == PAYLOAD_ERROR
+    assert detail == "media_player.office is unavailable"
+    assert run_wrapped('{"success": false, "error": "x"}') == [
+        '{"success": false, "error": "x"}'
+    ]
+
+
+def test_an_error_in_a_later_chunk_is_still_a_failure():
+    """pipecat concatenates every content chunk into one string, so an error can
+    land after good text. Matching only at position 0 missed those."""
+    outcome, detail = classify_result("Partial results...\n" + HARD_FAILURE)
     assert outcome == TOOL_ERROR
-    assert detail == "nope"
+    assert detail.startswith("Error calling tool:")
+
+
+def test_a_home_assistant_intent_error_is_reported():
+    """The most common HA failure: a name that matches no entity."""
+    outcome, detail = classify_result(
+        '{"speech": {"plain": {"speech": "Sorry, I am not aware of any device '
+        'called hallway light"}}, "response_type": "error", '
+        '"data": {"code": "no_valid_targets"}}'
+    )
+    assert outcome == PAYLOAD_ERROR
+    assert "not aware of any device" in detail
+
+
+def test_an_intent_error_without_speech_falls_back_to_the_code():
+    outcome, detail = classify_result(
+        '{"response_type": "error", "data": {"code": "no_valid_targets"}}'
+    )
+    assert outcome == PAYLOAD_ERROR
+    assert detail == "no_valid_targets"
+
+
+def test_action_done_with_failed_targets_is_reported():
+    outcome, detail = classify_result(
+        '{"response_type": "action_done", "data": {"success": [], '
+        '"failed": [{"name": "brewery lights"}]}}'
+    )
+    assert outcome == PAYLOAD_ERROR
+    assert "brewery lights" in detail
+
+
+def test_a_long_error_body_is_truncated_before_it_reaches_the_model():
+    """A large error body is logged at ERROR and injected into the model's
+    function result -- cap it the way the JSON branches already do."""
+    _, detail = classify_result("Error calling tool: " + "x" * 5000)
+    assert len(detail) <= 400
+    (delivered,) = run_wrapped("Error calling tool: " + "x" * 5000)
+    assert len(delivered) < 700
 
 
 @pytest.mark.parametrize("good", [SUCCESS, ACTION_DONE, "Live Context: An overview"])
@@ -120,13 +172,15 @@ def test_a_payload_error_is_forwarded_untouched():
     assert run_wrapped(SOFT_FAILURE) == [SOFT_FAILURE]
 
 
-def test_a_hard_failure_is_logged_as_an_error(caplog):
-    with caplog.at_level(logging.ERROR):
+def test_a_hard_failure_is_logged_as_an_error_and_not_as_a_success(caplog):
+    # capture at INFO: at ERROR the success-line assertion below could never
+    # fail, because INFO records were never captured in the first place.
+    with caplog.at_level(logging.INFO):
         run_wrapped(HARD_FAILURE)
     assert any(
         "❌ Tool 'play_music_library' FAILED" in r.message for r in caplog.records
     )
-    assert not any(r.levelno == logging.INFO for r in caplog.records)
+    assert not any("ok" == r.message.split()[-1] for r in caplog.records)
 
 
 def test_a_success_is_not_logged_as_an_error(caplog):
@@ -167,6 +221,32 @@ def test_install_skips_names_that_were_never_registered():
     """A tool trimmed by the allow-list must not take the session down."""
     llm = FakeLLM(["HassTurnOn"])
     assert install(llm, ["HassTurnOn", "not_registered"]) == 1
+
+
+def test_install_shouts_when_pipecat_renames_its_registry(caplog):
+    """Silent degradation is the trap: wrapping no-ops, the add-on reverts to
+    logging failures as successes, and the log shows a green checkmark."""
+
+    class NoRegistry:
+        pass
+
+    with caplog.at_level(logging.ERROR):
+        assert install(NoRegistry(), ["HassTurnOn"]) == 0
+    assert any("DISABLED" in r.message for r in caplog.records)
+
+
+def test_install_shouts_when_no_tool_matched(caplog):
+    llm = FakeLLM([])
+    with caplog.at_level(logging.ERROR):
+        assert install(llm, ["HassTurnOn", "play_music_library"]) == 0
+    assert any("DISABLED" in r.message for r in caplog.records)
+
+
+def test_install_is_quiet_when_there_were_no_tools_to_wrap(caplog):
+    llm = FakeLLM([])
+    with caplog.at_level(logging.ERROR):
+        assert install(llm, []) == 0
+    assert not caplog.records
 
 
 def test_wrap_handler_works_on_pipecats_real_params_object():
