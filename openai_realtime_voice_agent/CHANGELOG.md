@@ -2,6 +2,20 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.7.2
+
+- **A conversation now ends.** 0.7.1 reopened the follow-up window after EVERY
+  assistant reply, so any answered utterance restarted the chain: ambient room
+  speech kept getting answered and the turn never terminated — observed live
+  2026-08-30 as 2+ minutes of continuously billed audio with the LED ring never
+  going dark. New option `follow_up_max_turns` (default `3`, `0` = unlimited)
+  counts consecutive completed assistant turns since the last wake; on reaching
+  the cap the add-on pushes `follow_up_ms: 0` to the device just before the
+  end-of-reply `idle`, so the window does not reopen and the puck falls back to
+  wake-word-only. The counter resets on wake, on device reconnect, and on
+  session recreate (a new pipeline builds a new counter). Logs
+  `follow-up chain cap reached (3) — waiting for wake word`.
+
 ## 0.7.1
 
 Three fixes from the first in-room session on 0.7.0.

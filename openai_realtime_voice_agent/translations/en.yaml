@@ -76,6 +76,13 @@ configuration:
       keep talking — no wake word needed. The LED ring shows the listening
       colour while it waits. 8 feels natural; 0 turns it off (wake word
       before every question).
+  follow_up_max_turns:
+    name: "\U0001F4AC Conversation \u00B7 Follow-up chain limit (turns)"
+    description: >-
+      How many answers in a row you can get from one wake word before the
+      device stops listening on its own and waits for "Hey Trixie" again.
+      Without a limit an overheard remark keeps the microphone open and the
+      conversation never ends. 3 is a natural back-and-forth; 0 = no limit.
   follow_up_open_delay_ms:
     name: "💬 Conversation · Follow-up mic delay (ms)"
     description: >-

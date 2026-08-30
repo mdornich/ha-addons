@@ -119,7 +119,8 @@ class PhaseEmitter(FrameProcessor):
     # How often to log that we're deliberately waiting on a running tool.
     INFLIGHT_LOG_EVERY_S = 30.0
 
-    def __init__(self, send_phase, idle_debounce_s: float = None, **kwargs):
+    def __init__(self, send_phase, idle_debounce_s: float = None,
+                 follow_up_chain=None, set_follow_up_ms=None, **kwargs):
         """
         Args:
             send_phase: async callable(value: str) that delivers the phase to
@@ -129,9 +130,22 @@ class PhaseEmitter(FrameProcessor):
                 PHASE_IDLE_DEBOUNCE_MS env var (1500 ms) — long enough to bridge
                 the inter-sentence / tool-call gaps in OpenAI Realtime TTS so the
                 LED and the "stop" wake word stay active for the whole answer.
+            follow_up_chain: optional `app.follow_up.FollowUpChain` counting
+                consecutive assistant turns since the last wake. This processor
+                owns it because the debounced end-of-reply `idle` — emitted
+                right here — is the exact event the device turns into a
+                follow-up window; nothing else in the pipeline knows when a
+                reply has truly finished (TTS arrives in segments).
+            set_follow_up_ms: optional async callable(ms) that pushes a new
+                follow-up window length to the device. Called with 0 just
+                BEFORE the capped turn's `idle`, so the device reads the new
+                value when it opens (or declines to open) the window. Message
+                order on the websocket guarantees it lands first.
         """
         super().__init__(**kwargs)
         self._send_phase = send_phase
+        self._follow_up_chain = follow_up_chain
+        self._set_follow_up_ms = set_follow_up_ms
         if idle_debounce_s is None:
             try:
                 idle_debounce_s = float(os.environ.get("PHASE_IDLE_DEBOUNCE_MS", "1500")) / 1000.0
@@ -170,8 +184,14 @@ class PhaseEmitter(FrameProcessor):
     def note_wake(self) -> None:
         """Device woke (or a follow-up window closed without speech). Until the
         next real UserStartedSpeaking, any UserStoppedSpeaking is a dangling
-        pre-wake VAD segment (see _speech_since_wake)."""
+        pre-wake VAD segment (see _speech_since_wake).
+
+        Also starts a fresh follow-up chain: the cap counts turns since the
+        last wake. (Restoring the device's window length is the caller's job —
+        it needs an await; see WebSocketHandler._on_device_wake.)"""
         self._speech_since_wake = False
+        if self._follow_up_chain is not None:
+            self._follow_up_chain.note_wake()
 
     def set_kill_window_handlers(self, on_dangling=None, on_real_speech=None,
                                  on_speech_stopped=None) -> None:
@@ -254,6 +274,22 @@ class PhaseEmitter(FrameProcessor):
             await self._emit("thinking")
             self._arm_watchdog()
             return
+        # The reply is genuinely over: this is a COMPLETED assistant turn, and
+        # the `idle` below is what makes the device open a follow-up window.
+        # Count it, and if the chain cap is reached tell the device the window
+        # is 0 ms BEFORE the idle goes out (see the ctor's set_follow_up_ms).
+        if self._follow_up_chain is not None:
+            if not self._follow_up_chain.note_assistant_turn_complete():
+                logger.info(
+                    "🔁 follow-up chain cap reached "
+                    f"({self._follow_up_chain.max_turns}) — waiting for wake word"
+                )
+                if self._set_follow_up_ms is not None:
+                    try:
+                        await self._set_follow_up_ms(0)
+                    except Exception as e:
+                        logger.warning(
+                            f"⚠️ could not close the follow-up window: {e!r}")
         await self._emit("idle")
 
     async def _thinking_watchdog(self) -> None:

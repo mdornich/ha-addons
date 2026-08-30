@@ -69,3 +69,50 @@ async def handle_follow_up_cutoff(openai_service, input_buffer, phase_emitter) -
     except Exception as e:
         logger.debug(f"🧽 mic-flush input clear no-op ({e!r})")
     return False
+
+
+class FollowUpChain:
+    """How many follow-ups a single wake may chain before the device goes quiet.
+
+    The 2026-08-30 21:xx live failure: the add-on reopens the follow-up window
+    after EVERY assistant reply, so any answered utterance reopened the mic,
+    ambient speech in the room kept getting answered, and the conversation never
+    ended — 2+ minutes of continuously billed audio with the ring never going
+    dark. Nothing in the loop was wrong individually; there was simply no
+    terminating condition other than a silent window.
+
+    This is that terminating condition: count CONSECUTIVE completed assistant
+    turns since the last device wake. When the count reaches `max_turns`, the
+    window is not reopened after that reply and the device falls back to
+    wake-word-only. `max_turns = 0` means unlimited (the pre-0.7.2 behaviour).
+
+    Deliberately a plain object with no I/O: the PhaseEmitter owns an instance
+    and consults it at the one moment that matters (the debounced end-of-reply
+    `idle`), which keeps this unit-testable without a pipeline.
+    """
+
+    def __init__(self, max_turns: int = 0) -> None:
+        self.max_turns = max(0, int(max_turns))
+        self._turns = 0
+
+    @property
+    def turns(self) -> int:
+        """Completed assistant turns since the last wake."""
+        return self._turns
+
+    def note_wake(self) -> None:
+        """A device wake (or a follow-up window that closed without speech)
+        starts a fresh chain."""
+        self._turns = 0
+
+    def note_assistant_turn_complete(self) -> bool:
+        """Count one completed assistant turn.
+
+        Returns True if the follow-up window may reopen after this reply,
+        False if the chain cap has been reached and the device should go back
+        to wake-word-only.
+        """
+        self._turns += 1
+        if self.max_turns == 0:
+            return True
+        return self._turns < self.max_turns

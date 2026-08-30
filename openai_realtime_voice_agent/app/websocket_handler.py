@@ -4,7 +4,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Optional, Callable, Awaitable, Dict
+from typing import Optional, Callable, Awaitable
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -22,7 +22,7 @@ from app.session_manager import SessionManager
 from app.audio_recording_service import AudioRecordingService
 from app.phase_emitter import PhaseEmitter
 from app.input_buffer import InputBufferTracker
-from app.follow_up import handle_follow_up_cutoff
+from app.follow_up import FollowUpChain, handle_follow_up_cutoff
 from app.transcript_logger import TranscriptLogger
 
 logger = logging.getLogger(__name__)
@@ -347,6 +347,7 @@ class WebSocketHandler:
         follow_up_open_delay_ms: int = 700,
         wake_open_delay_ms: int = 700,
         playback_prebuffer_ms: int = 0,
+        follow_up_max_turns: int = 0,
     ):
         """
         Initialize WebSocket handler.
@@ -365,6 +366,10 @@ class WebSocketHandler:
             wake_open_delay_ms: How long (ms) the device waits after the wake
                 chime before opening the mic, so the chime's hardware tail can't
                 leak into the fresh mic as a ghost turn. Sent in `hello`.
+            follow_up_max_turns: How many consecutive assistant replies one wake
+                may chain before the follow-up window stops reopening and the
+                device falls back to wake-word-only. 0 = unlimited (pre-0.7.2
+                behaviour, which let ambient speech keep the mic open forever).
         """
         self.host = host
         self.port = port
@@ -374,6 +379,12 @@ class WebSocketHandler:
         self.follow_up_open_delay_ms = max(0, int(follow_up_open_delay_ms))
         self.wake_open_delay_ms = max(0, int(wake_open_delay_ms))
         self.playback_prebuffer_ms = max(0, int(playback_prebuffer_ms))
+        self.follow_up_max_turns = max(0, int(follow_up_max_turns))
+        # The window length the DEVICE currently believes in. Diverges from
+        # self.follow_up_ms only while a chain cap has closed the window; the
+        # next wake restores it. Reset on every connect, because the `hello`
+        # sent there re-teaches the device the configured value.
+        self._follow_up_ms_live = self.follow_up_ms
 
         self.transport: Optional[WebsocketServerTransport] = None
         self.pipeline: Optional[Pipeline] = None
@@ -468,7 +479,14 @@ class WebSocketHandler:
         # idle through PhaseEmitter.force_idle() (consistent phase state +
         # racing-`thinking` suppression); it is APPENDED near the end of the
         # pipeline below, before transport.output().
-        phase_emitter = PhaseEmitter(send_phase=self.broadcast_phase)
+        # A FRESH chain per pipeline: a session recreate builds a new
+        # PhaseEmitter, so the turn counter starts at 0 by construction.
+        follow_up_chain = FollowUpChain(self.follow_up_max_turns)
+        phase_emitter = PhaseEmitter(
+            send_phase=self.broadcast_phase,
+            follow_up_chain=follow_up_chain,
+            set_follow_up_ms=self.set_device_follow_up_ms,
+        )
         # Speech-since-last-commit, for the follow-up cut-off (see the handler
         # `_on_device_mic_flush` below and app/input_buffer.py).
         input_buffer = InputBufferTracker()
@@ -668,6 +686,12 @@ class WebSocketHandler:
                 await openai_service.send_client_event(openai_rt_events.InputAudioBufferClearEvent())
                 input_buffer.note_clear("device reconnect")
                 logger.info("🎬 device (re)connected → input_audio_buffer.clear (clean start)")
+                # A reconnect is a fresh chain too: the device forgets its
+                # session, so a cap that closed the window must not persist.
+                # (Only the chain — NOT phase_emitter.note_wake(), which would
+                # also arm the dangling-VAD guard for a turn that may be live.)
+                follow_up_chain.note_wake()
+                await self.set_device_follow_up_ms(self.follow_up_ms)
             except Exception as e:
                 logger.debug(f"🎬 connect-time input clear no-op ({e!r})")
 
@@ -691,6 +715,9 @@ class WebSocketHandler:
             phase_emitter.note_wake()
             # Fresh turn: whatever the counters held belongs to the last one.
             input_buffer.note_clear("device wake")
+            # A wake restarts the follow-up chain (note_wake reset the counter);
+            # re-open the window if a previous chain cap had closed it.
+            await self.set_device_follow_up_ms(self.follow_up_ms)
             # New turn boundary: drop any pending post-tool kill so it can't
             # leak onto this fresh turn's response.
             _kill_next_response["v"] = False
@@ -779,6 +806,36 @@ class WebSocketHandler:
         for ws in list(self._websockets):
             await self._send_json(ws, obj)
 
+    def hello_payload(self, follow_up_ms: int) -> dict:
+        """The `hello` handshake the device parses for its tuning knobs.
+
+        va_client's handle_text_ matches on `"type":"hello"` and re-reads every
+        key it recognises, so re-sending this MID-SESSION is how the backend
+        changes the device's follow-up window without a reflash or a reconnect
+        (used by the chain cap — see set_device_follow_up_ms).
+        """
+        return {
+            "type": "hello",
+            "audio_out": "pcm",
+            "follow_up_ms": max(0, int(follow_up_ms)),
+            "follow_up_open_delay_ms": self.follow_up_open_delay_ms,
+            "wake_open_delay_ms": self.wake_open_delay_ms,
+            "playback_prebuffer_ms": self.playback_prebuffer_ms,
+        }
+
+    async def set_device_follow_up_ms(self, follow_up_ms: int) -> None:
+        """Tell the device how long its next follow-up window may stay open.
+
+        No-op when the device already holds this value, so the common path
+        (cap disabled, or a wake that was never capped) sends nothing.
+        """
+        follow_up_ms = max(0, int(follow_up_ms))
+        if follow_up_ms == self._follow_up_ms_live:
+            return
+        self._follow_up_ms_live = follow_up_ms
+        logger.info(f"🔁 follow-up window → {follow_up_ms}ms (pushed to device)")
+        await self.broadcast_json(self.hello_payload(follow_up_ms))
+
     async def broadcast_phase(self, value: str) -> None:
         """Send a va_client phase message to every connected device."""
         # TEMP instrumentation: log the broadcast + how many device sockets we
@@ -815,17 +872,10 @@ class WebSocketHandler:
             # follow_up_ms tells the device how long to keep the mic open after a
             # reply (post-reply follow-up window); 0/absent = turn-based. Sent on
             # every connect so an add-on config change takes effect on reconnect.
-            await self._send_json(
-                websocket,
-                {
-                    "type": "hello",
-                    "audio_out": "pcm",
-                    "follow_up_ms": self.follow_up_ms,
-                    "follow_up_open_delay_ms": self.follow_up_open_delay_ms,
-                    "wake_open_delay_ms": self.wake_open_delay_ms,
-                    "playback_prebuffer_ms": self.playback_prebuffer_ms,
-                },
-            )
+            # A reconnect re-teaches the device the CONFIGURED window, so any
+            # chain-cap suppression from the previous connection is void.
+            self._follow_up_ms_live = self.follow_up_ms
+            await self._send_json(websocket, self.hello_payload(self.follow_up_ms))
             await on_client_connected_callback(client_id)
 
         @transport.event_handler("on_client_disconnected")

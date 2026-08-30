@@ -355,6 +355,17 @@ class Application:
             follow_up_listen_seconds = 8
         follow_up_listen_seconds = max(0, min(60, follow_up_listen_seconds))
         follow_up_ms = follow_up_listen_seconds * 1000
+        # How many consecutive assistant replies one wake may chain before the
+        # follow-up window stops reopening. Without a cap (0.7.1 and earlier)
+        # every answered utterance reopened the mic, ambient room speech kept
+        # getting answered, and the conversation never ended — observed live
+        # 2026-08-30 as 2+ minutes of continuously billed audio with the ring
+        # never going dark. 0 = unlimited (the old behaviour).
+        try:
+            follow_up_max_turns = int(os.environ.get("FOLLOW_UP_MAX_TURNS", "3"))
+        except (TypeError, ValueError):
+            follow_up_max_turns = 3
+        follow_up_max_turns = max(0, min(10, follow_up_max_turns))
         # Delay (ms) before the follow-up mic opens, bridging the device speaker's
         # hardware tail so the mic doesn't catch the reply's own end. Sent to the
         # device in `hello`; lower = snappier, higher = safer against echo.
@@ -439,10 +450,12 @@ class Application:
             follow_up_open_delay_ms=follow_up_open_delay_ms,
             wake_open_delay_ms=wake_open_delay_ms,
             playback_prebuffer_ms=playback_prebuffer_ms,
+            follow_up_max_turns=follow_up_max_turns,
         )
         logger.info(
             f"🔁 Follow-up window: {follow_up_listen_seconds}s "
             f"({'enabled' if follow_up_ms > 0 else 'disabled — turn-based'}), "
+            f"chain cap {follow_up_max_turns if follow_up_max_turns else 'unlimited'} turn(s), "
             f"mic-open delay {follow_up_open_delay_ms}ms, "
             f"wake-open delay {wake_open_delay_ms}ms, "
             f"playback prebuffer {playback_prebuffer_ms}ms"

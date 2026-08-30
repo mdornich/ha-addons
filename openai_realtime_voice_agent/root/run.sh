@@ -14,6 +14,7 @@ MAX_OUTPUT_TOKENS=$(bashio::config 'max_output_tokens')
 
 # --- 💬 Conversation ---
 FOLLOW_UP_LISTEN_SECONDS=$(bashio::config 'follow_up_listen_seconds')
+FOLLOW_UP_MAX_TURNS=$(bashio::config 'follow_up_max_turns')
 FOLLOW_UP_OPEN_DELAY_MS=$(bashio::config 'follow_up_open_delay_ms')
 WAKE_OPEN_DELAY_MS=$(bashio::config 'wake_open_delay_ms')
 VAD_EAGERNESS=$(bashio::config 'vad_eagerness')
@@ -59,6 +60,7 @@ export OPENAI_VOICE
 export OPENAI_SPEED
 export MAX_OUTPUT_TOKENS
 export FOLLOW_UP_LISTEN_SECONDS
+export FOLLOW_UP_MAX_TURNS
 export FOLLOW_UP_OPEN_DELAY_MS
 export WAKE_OPEN_DELAY_MS
 export VAD_EAGERNESS

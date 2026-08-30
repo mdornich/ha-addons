@@ -77,6 +77,14 @@ configuration:
       kunt doorpraten — zonder opnieuw het wake-woord te zeggen. De LED-ring
       toont ondertussen de luisterkleur. 8 voelt natuurlijk; 0 zet het uit
       (wake-woord voor elke vraag).
+  follow_up_max_turns:
+    name: "\U0001F4AC Gesprek \u00B7 Limiet op doorpraten (beurten)"
+    description: >-
+      Hoeveel antwoorden je achter elkaar kunt krijgen na \u00E9\u00E9n
+      wake-woord voordat het apparaat vanzelf stopt met luisteren en weer op
+      "Hey Trixie" wacht. Zonder limiet houdt een opgevangen opmerking de
+      microfoon open en eindigt het gesprek nooit. 3 voelt natuurlijk; 0 = geen
+      limiet.
   follow_up_open_delay_ms:
     name: "💬 Gesprek · Naluister-vertraging (ms)"
     description: >-
