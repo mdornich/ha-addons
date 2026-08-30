@@ -331,6 +331,12 @@ class Application:
         # Bearer token for that adapter. Read here, passed straight to the tool
         # handler, and never logged.
         dex_adapter_token = os.environ.get("DEX_ADAPTER_TOKEN", "").strip()
+        try:
+            dex_timeout_s = float(os.environ.get("DEX_TIMEOUT_SECONDS", "60") or 60)
+        except ValueError:
+            dex_timeout_s = 60.0
+        dex_timeout_s = max(10.0, min(120.0, dex_timeout_s))
+        self.dex_timeout_s = dex_timeout_s
 
         # Web search: let the assistant look things up online (weather, news,
         # facts). ON by default; existing installs keep their saved option, so an
@@ -723,7 +729,9 @@ class Application:
                 self.openai_service.register_function(
                     "ask_dex",
                     create_dex_tool_handler(
-                        self.dex_adapter_url, adapter_token=self.dex_adapter_token
+                        self.dex_adapter_url,
+                        timeout_s=self.dex_timeout_s,
+                        adapter_token=self.dex_adapter_token,
                     ),
                 )
                 logger.info("✅ Registered ask_dex tool handler")

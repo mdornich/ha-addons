@@ -36,6 +36,7 @@ LONGLIVED_TOKEN=$(bashio::config 'longlived_token')
 # --- 🤖 Dex ---
 DEX_ADAPTER_URL=$(bashio::config 'dex_adapter_url')
 DEX_ADAPTER_TOKEN=$(bashio::config 'dex_adapter_token')
+DEX_TIMEOUT_SECONDS=$(bashio::config 'dex_timeout_seconds')
 
 # --- ⚙️ Advanced ---
 WEBSOCKET_PORT=$(bashio::config 'websocket_port')
@@ -75,6 +76,7 @@ export HA_DEVICE_ID
 export ASSIST_PIPELINE_NAME
 export DEX_ADAPTER_URL
 export DEX_ADAPTER_TOKEN
+export DEX_TIMEOUT_SECONDS
 export WEBSOCKET_PORT
 export SESSION_REUSE_TIMEOUT_SECONDS
 export MAX_CONTEXT_MESSAGES
