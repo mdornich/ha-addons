@@ -21,6 +21,8 @@ from app.raw_audio_serializer import RawAudioSerializer
 from app.session_manager import SessionManager
 from app.audio_recording_service import AudioRecordingService
 from app.phase_emitter import PhaseEmitter
+from app.input_buffer import InputBufferTracker
+from app.follow_up import handle_follow_up_cutoff
 from app.transcript_logger import TranscriptLogger
 
 logger = logging.getLogger(__name__)
@@ -169,9 +171,14 @@ class ConnectionRecovery(FrameProcessor):
     REFRESH_QUIET_S = 60.0    # ... and no mic audio flowed for this long
     REFRESH_CHECK_S = 60.0    # poll cadence of the background check
 
-    def __init__(self, openai_service, emit_idle=None, phase_emitter=None, **kwargs):
+    def __init__(self, openai_service, emit_idle=None, phase_emitter=None,
+                 input_buffer=None, **kwargs):
         super().__init__(**kwargs)
         self._service = openai_service
+        # Counts speech-since-last-commit for the follow-up cut-off decision
+        # (app/input_buffer.py). This processor is the only place every mic
+        # frame is already in hand, at the DEVICE's rate, before the resampler.
+        self._input_buffer = input_buffer
         self._emit_idle = emit_idle  # async callable(value:str), e.g. broadcast_phase
         # Preferred idle route: PhaseEmitter.force_idle() keeps the emitter's
         # phase state consistent AND suppresses the racing `thinking` from VAD
@@ -198,7 +205,9 @@ class ConnectionRecovery(FrameProcessor):
         if self._refresh_task is None:
             self._refresh_task = asyncio.create_task(self._proactive_refresh_loop())
         if isinstance(frame, InputAudioRawFrame):
-            # Only kept for the proactive-refresh "is anyone interacting?" check.
+            if self._input_buffer is not None:
+                self._input_buffer.note_audio(len(frame.audio), frame.sample_rate)
+            # Also kept for the proactive-refresh "is anyone interacting?" check.
             # (Stale-audio clearing is now done at the cut-off source — the device
             # sends {"type":"flush"} when a follow-up window times out — not
             # reactively on mic-resume, which disturbed the VAD and caused garbage.)
@@ -460,6 +469,9 @@ class WebSocketHandler:
         # racing-`thinking` suppression); it is APPENDED near the end of the
         # pipeline below, before transport.output().
         phase_emitter = PhaseEmitter(send_phase=self.broadcast_phase)
+        # Speech-since-last-commit, for the follow-up cut-off (see the handler
+        # `_on_device_mic_flush` below and app/input_buffer.py).
+        input_buffer = InputBufferTracker()
 
         pipeline_components = [
             transport.input(),
@@ -467,7 +479,7 @@ class WebSocketHandler:
             # to the task source, so place this upstream of the service) and
             # reconnect in place. Without it a 1011/1001 drop bricks the session.
             ConnectionRecovery(openai_service=openai_service, emit_idle=self.broadcast_phase,
-                               phase_emitter=phase_emitter),
+                               phase_emitter=phase_emitter, input_buffer=input_buffer),
             InputResampler(out_rate=PIPELINE_SAMPLE_RATE),
             input_activity_tracker,
         ]
@@ -608,6 +620,7 @@ class WebSocketHandler:
             _kill_next_response["v"] = True
             try:
                 await openai_service.send_client_event(openai_rt_events.InputAudioBufferClearEvent())
+                input_buffer.note_clear("device interrupt")
                 logger.info("🛑 device interrupt → input_audio_buffer.clear sent (drop in-flight user audio)")
             except Exception as e:
                 logger.info(f"🛑 device interrupt → input_audio_buffer.clear no-op ({e!r})")
@@ -653,24 +666,21 @@ class WebSocketHandler:
             # covered by the device's {"type":"flush"} on follow-up timeout.
             try:
                 await openai_service.send_client_event(openai_rt_events.InputAudioBufferClearEvent())
+                input_buffer.note_clear("device reconnect")
                 logger.info("🎬 device (re)connected → input_audio_buffer.clear (clean start)")
             except Exception as e:
                 logger.debug(f"🎬 connect-time input clear no-op ({e!r})")
 
         async def _on_device_mic_flush():
             # The device sends {"type":"flush"} when a follow-up window times out
-            # mid-stream. Drop any uncommitted partial utterance NOW, at the
-            # cut-off, so a later wake can't "complete" it into a stale answer.
-            # This replaced the reactive clear-on-mic-resume, which fired on
-            # every wake and disturbed the server VAD → spurious garbage commits.
-            # Also a turn boundary for the dangling-VAD guard: the follow-up
-            # closed without speech, so any later server-VAD stop is dangling.
-            phase_emitter.note_wake()
-            try:
-                await openai_service.send_client_event(openai_rt_events.InputAudioBufferClearEvent())
-                logger.info("🧽 follow-up cut-off → input_audio_buffer.clear (drop partial utterance)")
-            except Exception as e:
-                logger.debug(f"🧽 mic-flush input clear no-op ({e!r})")
+            # mid-stream. Whether that means "drop it" or "the user just finished
+            # talking" is decided in app/follow_up.py — see the 13:49:01 bug
+            # documented there.
+            await handle_follow_up_cutoff(
+                openai_service=openai_service,
+                input_buffer=input_buffer,
+                phase_emitter=phase_emitter,
+            )
 
         async def _on_device_wake():
             # va_client sends {"type":"wake"} on every wake (start_session). Mark
@@ -679,6 +689,8 @@ class WebSocketHandler:
             # segment closing late → suppress its thinking + cancel its garbage
             # response (handled in PhaseEmitter via the kill-window callbacks).
             phase_emitter.note_wake()
+            # Fresh turn: whatever the counters held belongs to the last one.
+            input_buffer.note_clear("device wake")
             # New turn boundary: drop any pending post-tool kill so it can't
             # leak onto this fresh turn's response.
             _kill_next_response["v"] = False
@@ -693,11 +705,27 @@ class WebSocketHandler:
             # window and the post-tool flag so neither can cancel it.
             _interrupt_kill_until["t"] = 0.0
             _kill_next_response["v"] = False
+            # From here the mic frames arriving are the user's SPEECH, which is
+            # what the follow-up cut-off decision counts. It is also the moment
+            # the device stops its own follow-up expiry timer: PhaseEmitter emits
+            # "listening" on this same frame and va_client cancels "va_followup"
+            # on every `listening` (va_client.cpp set_phase_) — deliberately
+            # never deduped, so an in-progress utterance always extends the
+            # window instead of being cut off mid-sentence.
+            input_buffer.note_speech_started()
+
+        def _speech_stopped():
+            # The server VAD closed the utterance; its own commit follows, so the
+            # buffer is (about to be) empty. The grace window inside the tracker
+            # covers a flush that races that commit.
+            input_buffer.note_speech_stopped()
+            input_buffer.note_commit("server VAD end-of-turn")
 
         phase_emitter.set_kill_window_handlers(
             on_dangling=lambda: _interrupt_kill_until.__setitem__(
                 "t", time.monotonic() + INTERRUPT_KILL_WINDOW_S),
             on_real_speech=_clear_kill_window,
+            on_speech_stopped=_speech_stopped,
         )
 
         if self._serializer is not None:

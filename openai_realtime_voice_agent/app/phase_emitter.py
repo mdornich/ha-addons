@@ -161,6 +161,11 @@ class PhaseEmitter(FrameProcessor):
         # genuine new utterance — never cancel ITS response).
         self._on_dangling_stop = None
         self._on_real_speech = None
+        # Called on a REAL server-VAD end-of-utterance (not a dangling segment,
+        # not a stale tail during a reply). The follow-up cut-off logic uses it
+        # to know the input buffer has just been committed by the server —
+        # see app/input_buffer.py.
+        self._on_speech_stopped = None
 
     def note_wake(self) -> None:
         """Device woke (or a follow-up window closed without speech). Until the
@@ -168,10 +173,16 @@ class PhaseEmitter(FrameProcessor):
         pre-wake VAD segment (see _speech_since_wake)."""
         self._speech_since_wake = False
 
-    def set_kill_window_handlers(self, on_dangling=None, on_real_speech=None) -> None:
-        """Wire the dangling-VAD guard to the websocket_handler kill-window."""
+    def set_kill_window_handlers(self, on_dangling=None, on_real_speech=None,
+                                 on_speech_stopped=None) -> None:
+        """Wire the dangling-VAD guard to the websocket_handler kill-window.
+
+        `on_speech_stopped` is not part of that guard: it fires on a real
+        end-of-utterance so the input-buffer tracker knows the server committed.
+        """
         self._on_dangling_stop = on_dangling
         self._on_real_speech = on_real_speech
+        self._on_speech_stopped = on_speech_stopped
 
     async def force_idle(self, reason: str = "") -> None:
         """Declare the current turn dead and put the device in idle.
@@ -315,6 +326,9 @@ class PhaseEmitter(FrameProcessor):
                 # A VAD stop raced a turn-death force_idle — stay idle.
                 logger.info("📞 phase 'thinking' suppressed (turn already declared dead)")
             else:
+                # A real end-of-utterance: the server VAD commits the buffer here.
+                if self._on_speech_stopped is not None:
+                    self._on_speech_stopped()
                 await self._emit("thinking")
                 self._arm_watchdog()
         elif isinstance(frame, BotStartedSpeakingFrame):

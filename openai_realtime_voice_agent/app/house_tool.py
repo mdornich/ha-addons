@@ -67,9 +67,14 @@ def get_house_tool_definition() -> Dict[str, Any]:
             "volume, timers (setting, cancelling, and asking what is running "
             "or how much time is left), shopping and to-do lists, sensors, "
             "the weather here, and any question about the state of the house. "
-            "Pass the user's request as they said it, in plain English, "
-            "including the room if they named one — Home Assistant knows the "
-            "rooms and devices, you do not. This is the ONLY way to touch the "
+            "Pass ONE short imperative or question in the present tense, in the "
+            "user's own words, including the room if they named one — Home "
+            "Assistant knows the rooms and devices, you do not. Strip the "
+            "conversational framing first: no 'I asked if', no 'can you', no "
+            "'please', and never report what the user said. Home Assistant "
+            "matches sentences literally, so 'I asked if it was going to rain' "
+            "matches nothing and falls to a slow LLM fallback where 'is it "
+            "going to rain' is answered locally in milliseconds. This is the ONLY way to touch the "
             "home: never guess a device name, never claim an action is done "
             "without calling this, and never answer a question about the house "
             "from your own knowledge. Do not use it for general world "
@@ -81,11 +86,14 @@ def get_house_tool_definition() -> Dict[str, Any]:
                 "text": {
                     "type": "string",
                     "description": (
-                        "The user's request in natural English, as spoken, "
-                        "e.g. 'turn on the brewery lights', 'set a timer for "
-                        "one minute', 'add oat milk to my kroger list', "
-                        "'play the Beatles in the office', 'how much time is "
-                        "left'."
+                        "One short imperative or question in the present "
+                        "tense, in the user's own words, with no conversational "
+                        "framing. Exactly this shape: 'turn on the brewery "
+                        "lights', 'set a timer for one minute', 'is it going to "
+                        "rain', 'add oat milk to my kroger list', 'play the "
+                        "Beatles in the office', 'how much time is left'. NOT "
+                        "'I asked if it was going to rain', NOT 'can you turn "
+                        "on the brewery lights'."
                     ),
                 }
             },

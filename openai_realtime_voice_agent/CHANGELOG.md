@@ -2,6 +2,30 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.7.1
+
+Three fixes from the first in-room session on 0.7.0.
+
+- **A follow-up window that expires mid-question no longer throws the question
+  away.** The device closes its follow-up mic on a timer and sends
+  `{"type":"flush"}`; 0.7.0 answered that with an unconditional
+  `input_audio_buffer.clear`, so a question the server VAD had not committed yet
+  was discarded — no answer, ring still circling (observed 13:49:01). The
+  cut-off now COMMITS the buffer and creates a response when it holds real
+  speech (~600 ms, or the user was still talking), and only clears when the
+  buffer is effectively empty. New `app/input_buffer.py` counts speech — not
+  audio — since the last commit, so a silent 20 s window still clears.
+  Tunable with `FOLLOW_UP_COMMIT_MIN_SPEECH_MS` / `FOLLOW_UP_SPEECH_GRACE_MS`.
+- **The `house` tool is told how to phrase a request.** The model was relaying
+  the user's words as reported speech — `house` called with "I asked if it was
+  going to rain" — which matches no Home Assistant sentence and falls to the
+  slow LLM path (2.9 s) where the literal "is it going to rain" is answered
+  locally in 16 ms. The tool description now asks for one short imperative or
+  question in the present tense, framing stripped, with worked examples; the
+  persona says the same thing from the other side.
+- **The follow-up cut-off logic moved out of a closure** into
+  `app/follow_up.py` so it can be unit-tested. It could not be, before.
+
 ## 0.7.0
 
 **The home is Home Assistant's again.** The MCP client path is removed
