@@ -9,7 +9,9 @@ front half is custom **firmware for the Home Assistant Voice PE** device (see
 Voice PE device  ──WebSocket──▶  this add-on  ──▶  OpenAI Realtime API
 (mic up / speaker down)               │  tools
                                        ▼
-                              HA MCP Server (/api/mcp)  → controls your home
+                     house()  → HA Assist pipeline  → your home
+                     ask_dex() → the Dex agent adapter
+                     web_search() → the outside world
 ```
 
 ---
@@ -36,32 +38,91 @@ Voice PE device  ──WebSocket──▶  this add-on  ──▶  OpenAI Realti
 > in the logs, raise your usage tier in the OpenAI dashboard, or keep
 > `max_context_messages` modest (default 12).
 
-## 3. Let it control Home Assistant (MCP)
+## 3. Let it control Home Assistant (the `house` tool)
 
-The assistant controls your home through Home Assistant's **official MCP Server**.
+**As of 0.7.0 the MCP path is gone.** The assistant reaches your home through a
+single tool, `house`, which runs **Home Assistant's own Assist pipeline** — the
+same pipeline a Voice PE uses on stock firmware, with your device's `device_id`
+attached so it knows which room you are in.
 
-1. In HA: **Settings → Devices & Services → Add Integration → "Model Context
-   Protocol Server"** and add it.
-2. **Expose the entities** you want voice control over to **Assist**
-   (Settings → Voice assistants → *Exposed entities*). The MCP server only offers
-   what's exposed.
-3. In the add-on, leave **`ha_mcp_url`** **blank** — it then uses the built-in
-   endpoint (`http://supervisor/core/api/mcp`) with the add-on's own token. Leave
-   **`longlived_token`** blank too, unless startup logs a 401/403 on
-   `/core/api/mcp` (then paste a HA long-lived token there).
+That means nothing about your home is re-implemented in this add-on. Timers
+(which ring on the speaker), shopping and to-do lists, area targeting, media
+search and playback, your custom sentences, and your pipeline's own AI fallback
+for anything unmatched — all of it is whatever Home Assistant already does, at
+whatever speed Home Assistant already does it (15–350 ms for local intents on a
+typical house). When HA gains a new intent, the assistant gains it with no
+add-on update.
 
-You get a small fixed set of Assist tools (`HassTurnOn`, `HassTurnOff`,
-`HassLightSet`, `GetLiveContext`, `GetDateTime`, …). **`GetLiveContext`** is the
-"what's the current state?" tool — keep it; it's what answers *"is the light on?"*.
+**Setup:**
 
-**`mcp_tool_allowlist`** (optional): a comma-separated whitelist of tool names. Leave
-blank to expose all, or trim to just what you use, e.g.:
-`HassTurnOn,HassTurnOff,HassLightSet,GetLiveContext,GetDateTime`
+1. Build (or keep) an Assist pipeline in **Settings → Voice assistants**. Give it
+   a name and set **"Prefer handling commands locally"** on, so the fast local
+   intents run before any LLM.
+2. **Expose the entities** you want voice control over to Assist
+   (Settings → Voice assistants → *Exposed entities*). The pipeline only acts on
+   what is exposed.
+3. In the add-on set **`ha_device_id`** to the device ID of your Voice PE.
+   Settings → Devices → open the device → **⋮ → Copy device ID**.
+   **This is required.** Without it the pipeline has no room context, and the
+   `house` tool is not offered to the model at all — the assistant will not be
+   able to touch your home.
+4. Set **`assist_pipeline_name`** to your pipeline's name (default `Trixie`). It
+   is resolved **by name at run time**, so rebuilding the pipeline does not break
+   the add-on — but two pipelines with the same name is refused rather than
+   guessed.
+5. Leave **`longlived_token`** blank. The add-on authenticates with its own
+   Supervisor token against `ws://supervisor/core/websocket`. Only paste a HA
+   long-lived token if the log shows a 401/403 at startup.
+
+The add-on log prints one line per call with the elapsed time, whether HA handled
+it locally, and the reply:
+
+```
+🏠 house called: 'turn on the brewery lights'
+🏠 house 214.8 ms local=True type=action_done -> 'Turned on brewery lights'
+```
+
+## 3b. Talking to Dex (the `ask_dex` tool)
+
+Optional, and **off unless you configure it**. When `dex_adapter_url` is set, the
+assistant gets an `ask_dex` tool it may use **only when you name Dex** — "ask Dex
+what's on my calendar tomorrow". Your words go across verbatim and Dex's reply is
+spoken back verbatim; the assistant is the microphone, not the editor.
+
+There is **no such endpoint in 980labsOS today**. The supported Dex adapter,
+`agents/_runtime/hermes_invoke.py`, is a *local subprocess* adapter — it shells
+out to the `hermes` CLI on the gateway host and has no network surface, and this
+add-on runs in a container on the Home Assistant host. Inventing a transport is
+explicitly out of bounds (`docs/architecture/agent-interaction-model.md`).
+
+So `ask_dex` ships as the client half of this contract, waiting for a server:
+
+```
+POST <dex_adapter_url>
+Content-Type: application/json
+{"text": "<the user's verbatim transcript>", "source": "ha-voice-realtime"}
+
+200 OK
+{"reply": "<Dex's verbatim reply text>"}
+```
+
+`text`, `response` and `message` are accepted as aliases for `reply`. Any non-2xx,
+a non-JSON body, or a body with none of those keys is reported to the user as a
+failure — the assistant never invents an answer on Dex's behalf. The call is
+bounded at 30 s.
+
+**What still has to be built** (tracked on #1143, not shipped here): a small
+authenticated HTTP front for `invoke_hermes_profile(profile="dex", message=...)`
+on the gateway host, bound to the LAN. Because that is a new synchronous callable
+surface it needs the ratification the interaction model requires before it
+carries anything action-bearing.
+
+Leave `dex_adapter_url` blank and the tool is not exposed to the model at all.
 
 ## 4. Recommended starting settings
 
 **The defaults are the recommended settings** — for a first run you only need the
-API key, the MCP integration (section 3), and ideally your language. The
+API key, `ha_device_id` (section 3), and ideally your language. The
 Configuration tab is grouped: **🔑 Basics → 🗣️ Model & voice → 💬 Conversation →
 🌐 Web search → 🎚️ Audio → 🏠 Home Assistant → ⚙️ Advanced → 🔍 Debug**, and every
 option has plain-language inline help.
@@ -157,4 +218,4 @@ from-scratch guide (flashing + adopting the device in ESPHome Builder).
 - Backend forked from **[fjfricke/ha-openai-realtime](https://github.com/fjfricke/ha-openai-realtime)** (Felix Fricke).
 - Firmware thin-client design based on **[maxmaxme/home-assistant-voice-pe](https://github.com/maxmaxme/home-assistant-voice-pe)**, a fork of **[esphome/home-assistant-voice-pe](https://github.com/esphome/home-assistant-voice-pe)** (Nabu Casa / ESPHome).
 - Inspiration from **[marcinnowak79/home-assistant-voice-pe](https://github.com/marcinnowak79/home-assistant-voice-pe)** (gemini-live-proxy).
-- Built on **[pipecat-ai](https://github.com/pipecat-ai/pipecat)**, the **OpenAI Realtime API**, and the official **[Home Assistant MCP Server](https://www.home-assistant.io/integrations/mcp_server/)** integration.
+- Built on **[pipecat-ai](https://github.com/pipecat-ai/pipecat)**, the **OpenAI Realtime API**, and Home Assistant's own **[Assist pipeline](https://www.home-assistant.io/voice_control/)**.

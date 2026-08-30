@@ -1,5 +1,5 @@
 name: OpenAI Realtime 2 Voice Agent
-version: "0.6.2"
+version: "0.7.0"
 slug: openai_realtime_voice_agent
 # 980labsOS #1141: prebuilt aarch64 image, so the Pi PULLS instead of building
 # pipecat from source (the local build ran >2h on the Pi and starved HA's API).
@@ -16,8 +16,9 @@ init: false
 startup: application
 boot: auto
 host_network: true
-# Gives the add-on SUPERVISOR_TOKEN so it can reach Home Assistant (used as a
-# fallback auth token for the MCP server when longlived_token is left blank).
+# Gives the add-on SUPERVISOR_TOKEN so it can reach Home Assistant. That token
+# authenticates the `house` tool's websocket to ws://supervisor/core/websocket
+# (assist_pipeline/run); longlived_token stays as an override.
 homeassistant_api: true
 
 # ----------------------------------------------------------------------------
@@ -100,9 +101,21 @@ options:
   noise_reduction: "off"
 
   # --- 🏠 Home Assistant ---
-  ha_mcp_url: ""
+  # 0.7.0: the MCP path is GONE. The assistant reaches the home through ONE
+  # tool, `house`, which runs HA's own Assist pipeline on this device — native
+  # timers, lists, area targeting, media, custom sentences, and HA's own LLM
+  # fallback, at the 15-350 ms the native lane measures.
+  # ha_device_id is REQUIRED: without it the pipeline has no room context and
+  # the `house` tool is not exposed to the model at all.
+  ha_device_id: ""
+  assist_pipeline_name: "Trixie"
   longlived_token: ""
-  mcp_tool_allowlist: ""
+
+  # --- 🤖 Dex ---
+  # HTTP endpoint of the Hermes/Dex adapter. Blank (the default) = the `ask_dex`
+  # tool is not exposed. See DOCS.md for the request/response contract; no such
+  # endpoint ships with 980labsOS yet.
+  dex_adapter_url: ""
 
   # --- ⚙️ Advanced ---
   websocket_port: 8080
@@ -141,9 +154,11 @@ schema:
   playback_prebuffer_ms: int(0,2000)
   noise_reduction: "list(off|near_field|far_field)"
   # --- 🏠 Home Assistant ---
-  ha_mcp_url: str
+  ha_device_id: str
+  assist_pipeline_name: str
   longlived_token: password
-  mcp_tool_allowlist: str
+  # --- 🤖 Dex ---
+  dex_adapter_url: str
   # --- ⚙️ Advanced ---
   websocket_port: int(1024,65535)
   session_reuse_timeout_seconds: int(0,3600)

@@ -28,9 +28,12 @@ PLAYBACK_PREBUFFER_MS=$(bashio::config 'playback_prebuffer_ms')
 NOISE_REDUCTION=$(bashio::config 'noise_reduction')
 
 # --- 🏠 Home Assistant ---
-HA_MCP_URL=$(bashio::config 'ha_mcp_url')
+HA_DEVICE_ID=$(bashio::config 'ha_device_id')
+ASSIST_PIPELINE_NAME=$(bashio::config 'assist_pipeline_name')
 LONGLIVED_TOKEN=$(bashio::config 'longlived_token')
-MCP_TOOL_ALLOWLIST=$(bashio::config 'mcp_tool_allowlist')
+
+# --- 🤖 Dex ---
+DEX_ADAPTER_URL=$(bashio::config 'dex_adapter_url')
 
 # --- ⚙️ Advanced ---
 WEBSOCKET_PORT=$(bashio::config 'websocket_port')
@@ -65,7 +68,9 @@ export WEB_SEARCH_MODEL
 export PLAYBACK_PREBUFFER_MS
 export NOISE_REDUCTION
 export LONGLIVED_TOKEN
-export MCP_TOOL_ALLOWLIST
+export HA_DEVICE_ID
+export ASSIST_PIPELINE_NAME
+export DEX_ADAPTER_URL
 export WEBSOCKET_PORT
 export SESSION_REUSE_TIMEOUT_SECONDS
 export MAX_CONTEXT_MESSAGES
@@ -119,12 +124,12 @@ fi
 # over: SEMANTIC_VAD_CREATE_RESPONSE=true, ENABLE_DISCONNECT_TOOL=false,
 # INTERRUPT_RESPONSE=false, DEVICE_INPUT_SAMPLE_RATE=16000.
 
-# Export HA_MCP_URL if set (empty string means use default in main.py)
-if [ -n "$HA_MCP_URL" ]; then
-    export HA_MCP_URL
+# SUPERVISOR_TOKEN is automatically provided by Home Assistant when
+# homeassistant_api: true — it is what the `house` tool authenticates with
+# against ws://supervisor/core/websocket. Never logged, never echoed.
+if [ -z "$HA_DEVICE_ID" ]; then
+    bashio::log.warning "ha_device_id is empty -- the 'house' tool will be DISABLED"
 fi
-
-# SUPERVISOR_TOKEN is automatically provided by Home Assistant when homeassistant_api: true
 
 # Start the application
 export PYTHONUNBUFFERED=1

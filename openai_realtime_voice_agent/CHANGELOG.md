@@ -2,6 +2,29 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.7.0
+
+**The home is Home Assistant's again.** The MCP client path is removed
+entirely — `mcp_service.py`, `mcp_error_reporting.py`, the `ha_mcp_url` and
+`mcp_tool_allowlist` options, all of it. It cost 9–14 s per action, carried no
+device context, and had no timers or lists.
+
+In its place the assistant gets **one** house tool:
+
+- **`house(text)`** runs Home Assistant's own Assist pipeline
+  (`assist_pipeline/run`, `start_stage=intent`, `end_stage=intent`) on your
+  device, resolved by pipeline name at run time. Native timers that ring on the
+  speaker, lists, area targeting, media, custom sentences, and your pipeline's
+  own AI fallback — none of it re-implemented here, all of it at the speed HA
+  already runs it. New options: `ha_device_id` (**required**),
+  `assist_pipeline_name` (default `Trixie`).
+- **`ask_dex(text)`** relays a message to the Dex agent, verbatim in and
+  verbatim out, and only when the user names Dex. New option `dex_adapter_url`;
+  blank (the default) means the tool is not offered to the model at all. NOTE:
+  no such endpoint exists yet — see DOCS.md §3b for the contract a server must
+  satisfy.
+- `web_search` is unchanged and is now explicitly scoped to the outside world.
+
 ## 0.6.2
 
 - Failure reporting now also catches Home Assistant's own "I don't know that

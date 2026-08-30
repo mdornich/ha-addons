@@ -10,11 +10,11 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.server import WebsocketServerTransport
-from app.mcp_service import HomeAssistantMCPService
-from app.mcp_error_reporting import install as install_mcp_error_reporting
 from app.phase_emitter import TURN_LIVENESS
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
+from app.house_tool import get_house_tool_definition, create_house_tool_handler
+from app.dex_tool import get_dex_tool_definition, create_dex_tool_handler
 from app.audio_recording_service import AudioRecordingService
 from app.session_manager import SessionManager
 from app.websocket_handler import WebSocketHandler
@@ -166,7 +166,7 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
         wouldn't). Our tools are all short-lived (HA service calls, one web
         search), so letting them finish and report the truth always beats
         killing them halfway. This single override covers every registration
-        path (MCP tools via pipecat's MCPClient, web_search, disconnect).
+        path (house, ask_dex, web_search, disconnect).
 
         The handler is also wrapped to tick TURN_LIVENESS around its run, so
         the PhaseEmitter's thinking-watchdog knows a tool is in flight and a
@@ -221,7 +221,6 @@ class Application:
         self.websocket_handler: Optional[WebSocketHandler] = None
         self.websocket_transport: Optional[WebsocketServerTransport] = None
         self.openai_service: Optional[OpenAIRealtimeLLMService] = None
-        self.mcp_service: Optional[HomeAssistantMCPService] = None
         self.audio_recording_service: Optional[AudioRecordingService] = None
         self.session_manager: Optional[SessionManager] = None
         self.current_task: Optional[PipelineTask] = None
@@ -319,10 +318,17 @@ class Application:
         if noise_reduction not in ("near_field", "far_field"):
             noise_reduction = ""
 
-        # Optional allow-list to trim the (large) ha-mcp tool set exposed to the
-        # model. Comma-separated tool names; empty means expose all.
-        mcp_tool_allowlist = [t.strip() for t in os.environ.get("MCP_TOOL_ALLOWLIST", "").split(",") if t.strip()]
-        
+        # --- The house tool: Home Assistant's own Assist pipeline ---
+        # device_id of the Voice PE puck this add-on serves. Without it the
+        # pipeline has no room context and "turn on the lights" is meaningless,
+        # so the tool is NOT exposed when it is blank.
+        ha_device_id = os.environ.get("HA_DEVICE_ID", "").strip()
+        assist_pipeline_name = os.environ.get("ASSIST_PIPELINE_NAME", "Trixie").strip() or "Trixie"
+        # --- The Dex tool: the Hermes adapter's (not-yet-built) HTTP front ---
+        # See app/dex_tool.py for the contract. Blank -> the tool is NOT exposed,
+        # so the model cannot call it and cannot invent a Dex answer.
+        dex_adapter_url = os.environ.get("DEX_ADAPTER_URL", "").strip()
+
         # Web search: let the assistant look things up online (weather, news,
         # facts). ON by default; existing installs keep their saved option, so an
         # Update won't silently flip it. When on, a `web_search` function tool
@@ -398,20 +404,30 @@ class Application:
         if not openai_api_key:
             raise ValueError("OPENAI_API_KEY environment variable is required")
         
-        # Initialize Home Assistant MCP Service
-        mcp_client = None
-        try:
-            supervisor_token = os.environ.get("LONGLIVED_TOKEN") or os.environ.get("SUPERVISOR_TOKEN")
-            ha_mcp_url = os.environ.get("HA_MCP_URL", "http://supervisor/core/api/mcp")
-            if supervisor_token:
-                logger.info("Loading Home Assistant MCP tools...")
-                self.mcp_service = HomeAssistantMCPService(url=ha_mcp_url, access_token=supervisor_token)
-                mcp_client = await self.mcp_service.initialize()
-                logger.info("✅ Home Assistant MCP Client initialized")
-            else:
-                logger.warning("⚠️ SUPERVISOR_TOKEN not set, skipping Home Assistant MCP integration")
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to initialize Home Assistant MCP Client: {e}")
+        # Home Assistant access for the house tool. SUPERVISOR_TOKEN is injected
+        # by the Supervisor (config.yaml homeassistant_api: true); longlived_token
+        # stays supported as an override for running outside the Supervisor.
+        ha_token = os.environ.get("LONGLIVED_TOKEN") or os.environ.get("SUPERVISOR_TOKEN") or ""
+        enable_house = bool(ha_device_id and ha_token)
+        if not ha_device_id:
+            logger.warning(
+                "⚠️ ha_device_id is not set — the `house` tool is DISABLED and the "
+                "assistant cannot touch the home"
+            )
+        elif not ha_token:
+            logger.warning(
+                "⚠️ no SUPERVISOR_TOKEN/longlived_token — the `house` tool is DISABLED"
+            )
+        else:
+            logger.info(
+                f"🏠 house tool enabled (device_id={ha_device_id}, "
+                f"pipeline={assist_pipeline_name!r})"
+            )
+        enable_dex = bool(dex_adapter_url)
+        if enable_dex:
+            logger.info(f"🤖 ask_dex tool enabled (adapter={dex_adapter_url})")
+        else:
+            logger.info("🤖 ask_dex tool disabled (dex_adapter_url is blank)")
         
         # Initialize WebSocket handler
         self.websocket_handler = WebSocketHandler(
@@ -451,8 +467,12 @@ class Application:
         self.openai_speed = openai_speed
         self.max_output_tokens = max_output_tokens
         self.noise_reduction = noise_reduction
-        self.mcp_tool_allowlist = mcp_tool_allowlist
-        self.mcp_client = mcp_client
+        self.ha_device_id = ha_device_id
+        self.assist_pipeline_name = assist_pipeline_name
+        self.ha_token = ha_token
+        self.enable_house = enable_house
+        self.dex_adapter_url = dex_adapter_url
+        self.enable_dex = enable_dex
         self.enable_web_search = enable_web_search
         self.web_search_model = web_search_model
 
@@ -537,44 +557,22 @@ class Application:
             if self.enable_disconnect_tool:
                 all_tools.append(get_disconnect_tool_definition())
 
+            # The house: Home Assistant's own Assist pipeline, one tool. This
+            # replaces the whole MCP path — nothing about the home is
+            # re-implemented here, so when HA gains an intent the assistant
+            # gains it with no add-on change.
+            if self.enable_house:
+                all_tools.append(get_house_tool_definition())
+
+            # Dex, only when named (#1143). Not exposed at all when the adapter
+            # URL is blank, so the model cannot invent a Dex answer.
+            if self.enable_dex:
+                all_tools.append(get_dex_tool_definition())
+
             # Web search tool (optional). Lets the model look things up online via
             # a secondary OpenAI Responses web_search call in the handler.
             if self.enable_web_search:
                 all_tools.append(get_web_search_tool_definition())
-
-            # Get MCP tool definitions if available
-            mcp_tools_schema = None
-            if self.mcp_client:
-                try:
-                    logger.info("🔧 Fetching MCP tool definitions...")
-                    mcp_tools_schema = await self.mcp_client.get_tools_schema()
-                    
-                    # Convert MCP tool schemas to OpenAI format, applying the
-                    # optional allow-list so the realtime session isn't flooded
-                    # with ha-mcp's 80+ tools.
-                    exposed = 0
-                    for function_schema in mcp_tools_schema.standard_tools:
-                        if self.mcp_tool_allowlist and function_schema.name not in self.mcp_tool_allowlist:
-                            continue
-                        openai_tool = {
-                            "type": "function",
-                            "name": function_schema.name,
-                            "description": function_schema.description,
-                            "parameters": {
-                                "type": "object",
-                                "properties": function_schema.properties,
-                                "required": function_schema.required
-                            }
-                        }
-                        all_tools.append(openai_tool)
-                        exposed += 1
-
-                    if self.mcp_tool_allowlist:
-                        logger.info(f"✅ Fetched {len(mcp_tools_schema.standard_tools)} MCP tools, exposing {exposed} per allow-list")
-                    else:
-                        logger.info(f"✅ Fetched {len(mcp_tools_schema.standard_tools)} MCP tools")
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to fetch MCP tool definitions: {e}")
             
             # Turn detection: semantic_vad (recommended — semantic end-of-turn,
             # echo-resistant, doesn't cut the user off) or classic server_vad.
@@ -686,33 +684,27 @@ class Application:
                 )
                 logger.info(f"✅ Registered web_search tool handler (model={self.web_search_model})")
             
-            # Register MCP tool handlers if available
-            if self.mcp_client and mcp_tools_schema:
-                try:
-                    await self.mcp_client.register_tools_schema(mcp_tools_schema, self.openai_service)
-                    logger.info(f"✅ Registered {len(mcp_tools_schema.standard_tools)} MCP tool handlers")
-                except Exception as e:
-                    logger.warning(f"⚠️ Failed to register MCP tool handlers: {e}")
+            # Register the house tool handler (only when the tool is exposed)
+            if self.enable_house:
+                self.openai_service.register_function(
+                    "house",
+                    create_house_tool_handler(
+                        device_id=self.ha_device_id,
+                        pipeline_name=self.assist_pipeline_name,
+                        token=self.ha_token,
+                    ),
+                )
+                logger.info(
+                    f"✅ Registered house tool handler (pipeline={self.assist_pipeline_name!r})"
+                )
 
-                # Pipecat logs every call that returned text as "completed
-                # successfully", including hard failures, and hands the raw
-                # traceback fragment to the model. Wrap the handlers so a failed
-                # tool is visible in the log and unambiguous to the model. See
-                # app/mcp_error_reporting.py. Its own try/except: registration
-                # above may well have succeeded, and reporting a registration
-                # failure for a wrapping failure would misdiagnose exactly the
-                # class of problem this code exists to make diagnosable.
-                try:
-                    wrapped = install_mcp_error_reporting(
-                        self.openai_service,
-                        [s.name for s in mcp_tools_schema.standard_tools],
-                    )
-                    logger.info(f"✅ Error reporting wrapped {wrapped} MCP tool handlers")
-                except Exception as e:
-                    logger.error(
-                        f"❌ MCP error reporting DISABLED ({e!r}) -- tools still work, "
-                        "but failed calls will log as successes"
-                    )
+            # Register the Dex tool handler (only when the tool is exposed)
+            if self.enable_dex:
+                self.openai_service.register_function(
+                    "ask_dex",
+                    create_dex_tool_handler(self.dex_adapter_url),
+                )
+                logger.info("✅ Registered ask_dex tool handler")
             
             # Register service with session manager
             if client_id:
