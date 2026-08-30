@@ -328,6 +328,9 @@ class Application:
         # See app/dex_tool.py for the contract. Blank -> the tool is NOT exposed,
         # so the model cannot call it and cannot invent a Dex answer.
         dex_adapter_url = os.environ.get("DEX_ADAPTER_URL", "").strip()
+        # Bearer token for that adapter. Read here, passed straight to the tool
+        # handler, and never logged.
+        dex_adapter_token = os.environ.get("DEX_ADAPTER_TOKEN", "").strip()
 
         # Web search: let the assistant look things up online (weather, news,
         # facts). ON by default; existing installs keep their saved option, so an
@@ -436,7 +439,10 @@ class Application:
             )
         enable_dex = bool(dex_adapter_url)
         if enable_dex:
-            logger.info(f"🤖 ask_dex tool enabled (adapter={dex_adapter_url})")
+            logger.info(
+                f"🤖 ask_dex tool enabled (adapter={dex_adapter_url}, "
+                f"token={'set' if dex_adapter_token else 'unset'})"
+            )
         else:
             logger.info("🤖 ask_dex tool disabled (dex_adapter_url is blank)")
         
@@ -485,6 +491,7 @@ class Application:
         self.ha_token = ha_token
         self.enable_house = enable_house
         self.dex_adapter_url = dex_adapter_url
+        self.dex_adapter_token = dex_adapter_token
         self.enable_dex = enable_dex
         self.enable_web_search = enable_web_search
         self.web_search_model = web_search_model
@@ -715,7 +722,9 @@ class Application:
             if self.enable_dex:
                 self.openai_service.register_function(
                     "ask_dex",
-                    create_dex_tool_handler(self.dex_adapter_url),
+                    create_dex_tool_handler(
+                        self.dex_adapter_url, adapter_token=self.dex_adapter_token
+                    ),
                 )
                 logger.info("✅ Registered ask_dex tool handler")
             

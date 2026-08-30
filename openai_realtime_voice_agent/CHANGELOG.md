@@ -2,6 +2,18 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.7.3
+
+- **`ask_dex` now has a server to talk to, and authenticates to it.** 980labsOS
+  ships `dex-voice-ask` (launchd on the Mac mini, `agents/dex/voice/dex_voice_ask.py`),
+  the authenticated HTTP front for the Hermes Dex adapter — ratified into
+  `docs/architecture/agent-interaction-model.md`'s inline-query exception list on
+  2026-08-30 as a verbatim relay. New option `dex_adapter_token` (password): when
+  set it is sent as `Authorization: Bearer ...` on every adapter call. Without it
+  0.7.2 sent no credential at all, so every call to a token-protected adapter
+  would have been a 401. The token is never logged; the start log shows only
+  `token=set`/`token=unset`.
+
 ## 0.7.2
 
 - **A conversation now ends.** 0.7.1 reopened the follow-up window after EVERY

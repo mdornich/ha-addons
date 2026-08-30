@@ -27,6 +27,7 @@ have a server:
 
     POST  <dex_adapter_url>
     Content-Type: application/json
+    Authorization: Bearer <dex_adapter_token>   (sent only when configured)
     {"text": "<the user's verbatim transcript>",
      "source": "ha-voice-realtime",
      "conversation_id": "<optional, for follow-ups in one Realtime session>"}
@@ -42,11 +43,12 @@ NOT registered with the model at all (see main.py), so it cannot be called and
 cannot hallucinate a Dex answer. If it somehow is called with no URL configured
 it returns an explicit "not wired" sentence rather than a plausible reply.
 
-WHAT STILL HAS TO BE BUILT (out of scope for this brief, tracked on #1143):
-a small HTTP front for `invoke_hermes_profile(profile="dex", message=...)` on
-the gateway host, bound to the LAN, authenticated, and — because it is a new
-synchronous callable surface — ratified the way the interaction model requires
-before it carries anything action-bearing.
+THE SERVER NOW EXISTS (0.7.3): `dex-voice-ask`, launchd-managed on the Mac mini
+(980labsOS `agents/dex/voice/dex_voice_ask.py`), bound to the mini's LAN address
+and requiring the bearer token. It was ratified into
+`docs/architecture/agent-interaction-model.md`'s inline-query exception list on
+2026-08-30, verbatim relay only. Point `dex_adapter_url` at `http://<mini>:8765/ask`
+and paste the token into `dex_adapter_token`.
 """
 
 import asyncio
@@ -121,18 +123,26 @@ class DexToolError(RuntimeError):
         super().__init__(detail)
 
 
-def _post_sync(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
+def _post_sync(
+    url: str,
+    payload: Dict[str, Any],
+    timeout_s: float,
+    token: str = "",
+) -> Dict[str, Any]:
     """Blocking POST. Run via asyncio.to_thread so the voice loop keeps running.
 
     urllib rather than aiohttp/httpx on purpose: no new dependency in an image
     that already takes >2 h to build from source on the Pi, and trivially
     mockable in tests.
     """
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
         method="POST",
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
@@ -171,7 +181,10 @@ def extract_reply(payload: Dict[str, Any]) -> str:
 def create_dex_tool_handler(
     adapter_url: str,
     timeout_s: float = DEFAULT_TIMEOUT_S,
-    poster: Optional[Callable[[str, Dict[str, Any], float], Dict[str, Any]]] = None,
+    poster: Optional[
+        Callable[[str, Dict[str, Any], float, str], Dict[str, Any]]
+    ] = None,
+    adapter_token: str = "",
 ) -> Callable[["FunctionCallParams"], Awaitable[None]]:
     """Create the `ask_dex` handler for pipecat's OpenAIRealtimeLLMService.
 
@@ -179,6 +192,9 @@ def create_dex_tool_handler(
     """
     post = poster or _post_sync
     url = (adapter_url or "").strip()
+    # NEVER logged. The token only ever leaves this module inside the
+    # Authorization header of the adapter call.
+    token = (adapter_token or "").strip()
 
     async def dex_tool_handler(params: "FunctionCallParams") -> None:
         text = ((params.arguments or {}).get("text") or "").strip()
@@ -198,7 +214,7 @@ def create_dex_tool_handler(
         started = loop.time()
         try:
             response = await asyncio.wait_for(
-                asyncio.to_thread(post, url, payload, timeout_s),
+                asyncio.to_thread(post, url, payload, timeout_s, token),
                 timeout=timeout_s,
             )
         except asyncio.TimeoutError:

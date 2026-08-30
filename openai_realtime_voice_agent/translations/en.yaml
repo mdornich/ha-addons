@@ -181,6 +181,12 @@ configuration:
       returns its reply. When set, the assistant can pass on anything you
       address to Dex by name, word for word. Leave empty if you do not run a
       Dex adapter — the feature is then hidden from the assistant entirely.
+  dex_adapter_token:
+    name: "🤖 Dex · Adapter token"
+    description: >-
+      Optional. Bearer token for the Dex adapter above; it is sent as an
+      `Authorization: Bearer ...` header on every call. Leave empty only if
+      your adapter needs no authentication.
 
   # --- ⚙️ Advanced ---
   websocket_port:

@@ -89,33 +89,32 @@ assistant gets an `ask_dex` tool it may use **only when you name Dex** — "ask 
 what's on my calendar tomorrow". Your words go across verbatim and Dex's reply is
 spoken back verbatim; the assistant is the microphone, not the editor.
 
-There is **no such endpoint in 980labsOS today**. The supported Dex adapter,
-`agents/_runtime/hermes_invoke.py`, is a *local subprocess* adapter — it shells
-out to the `hermes` CLI on the gateway host and has no network surface, and this
-add-on runs in a container on the Home Assistant host. Inventing a transport is
-explicitly out of bounds (`docs/architecture/agent-interaction-model.md`).
+The server is `dex-voice-ask` in 980labsOS (`agents/dex/voice/dex_voice_ask.py`),
+launchd-managed on the Mac mini and bound to the mini's LAN address. It wraps the
+supported Dex adapter, `agents/_runtime/hermes_invoke.py`, and adds no capability
+of its own; it was ratified into the inline-query exception list in
+`docs/architecture/agent-interaction-model.md` on 2026-08-30 as a verbatim relay.
 
-So `ask_dex` ships as the client half of this contract, waiting for a server:
+The contract:
 
 ```
 POST <dex_adapter_url>
 Content-Type: application/json
+Authorization: Bearer <dex_adapter_token>     # sent only when the option is set
 {"text": "<the user's verbatim transcript>", "source": "ha-voice-realtime"}
 
 200 OK
 {"reply": "<Dex's verbatim reply text>"}
+401 -- missing/wrong token   429 -- Dex is already answering   504 -- Dex timed out
 ```
+
+`dex-voice-ask` requires the bearer token: set `dex_adapter_token` to the value in
+the mini's `~/.980labsOS/dex-voice-ask/env` or every call comes back 401.
 
 `text`, `response` and `message` are accepted as aliases for `reply`. Any non-2xx,
 a non-JSON body, or a body with none of those keys is reported to the user as a
 failure — the assistant never invents an answer on Dex's behalf. The call is
 bounded at 30 s.
-
-**What still has to be built** (tracked on #1143, not shipped here): a small
-authenticated HTTP front for `invoke_hermes_profile(profile="dex", message=...)`
-on the gateway host, bound to the LAN. Because that is a new synchronous callable
-surface it needs the ratification the interaction model requires before it
-carries anything action-bearing.
 
 Leave `dex_adapter_url` blank and the tool is not exposed to the model at all.
 

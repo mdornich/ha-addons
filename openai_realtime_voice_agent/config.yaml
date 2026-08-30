@@ -1,5 +1,5 @@
 name: OpenAI Realtime 2 Voice Agent
-version: "0.7.2"
+version: "0.7.3"
 slug: openai_realtime_voice_agent
 # 980labsOS #1141: prebuilt aarch64 image, so the Pi PULLS instead of building
 # pipecat from source (the local build ran >2h on the Pi and starved HA's API).
@@ -122,6 +122,9 @@ options:
   # tool is not exposed. See DOCS.md for the request/response contract; no such
   # endpoint ships with 980labsOS yet.
   dex_adapter_url: ""
+  # Bearer token the adapter requires. Blank = no Authorization header is sent
+  # (only sensible for an adapter with no auth); dex-voice-ask requires it.
+  dex_adapter_token: ""
 
   # --- ⚙️ Advanced ---
   websocket_port: 8080
@@ -166,6 +169,7 @@ schema:
   longlived_token: password
   # --- 🤖 Dex ---
   dex_adapter_url: str
+  dex_adapter_token: password
   # --- ⚙️ Advanced ---
   websocket_port: int(1024,65535)
   session_reuse_timeout_seconds: int(0,3600)
