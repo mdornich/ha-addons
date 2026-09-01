@@ -13,7 +13,7 @@ from pipecat.transports.websocket.server import WebsocketServerTransport, Websoc
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
-from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame, StartFrame, EndFrame, ErrorFrame
+from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame, StartFrame, EndFrame, CancelFrame, ErrorFrame
 from pipecat.audio.utils import create_stream_resampler
 from pipecat.services.openai.realtime import events as openai_rt_events
 
@@ -134,6 +134,17 @@ class ConnectionRecovery(FrameProcessor):
          exactly the one reset_conversation reconnects.
     A guard + cooldown collapse the error flood into a single reconnect attempt,
     retrying at most every RECONNECT_COOLDOWN_S while the link stays down.
+
+    Errors are not the only way the session dies: it can also go quietly absent
+    (no websocket / never became api-session-ready) after a failed recovery, with
+    no further ErrorFrames to react to. So the background loop is a HEALTH loop,
+    not just a proactive-refresh loop: each tick it also checks for a session
+    that has been disconnected continuously for HEALTH_DEAD_S and forces a
+    recovery. And when three recoveries fail back to back it logs one
+    REALTIME_SESSION_WEDGED line, so a zombie add-on is greppable in the log
+    instead of being invisible behind a repeating warning. cleanup() (and an
+    EndFrame/CancelFrame) stops that loop, so a torn-down pipeline never keeps
+    reconnecting a service nobody is using.
     """
 
     # Substrings that mark a dead/closed OpenAI websocket (vs an app-level error
@@ -169,7 +180,13 @@ class ConnectionRecovery(FrameProcessor):
     # mid-conversation (where it costs the user a turn).
     REFRESH_AGE_S = 55 * 60   # refresh once the session is this old
     REFRESH_QUIET_S = 60.0    # ... and no mic audio flowed for this long
-    REFRESH_CHECK_S = 60.0    # poll cadence of the background check
+    REFRESH_CHECK_S = 15.0    # poll cadence of the background check
+    # Health probe: how long the OpenAI session may look disconnected (no
+    # websocket, or never became api-session-ready) before we force a recovery.
+    # With REFRESH_CHECK_S=15 the probe reacts within ~35 s of the session dying.
+    HEALTH_DEAD_S = 20.0
+    # Consecutive failed recoveries before we log the wedge marker (once).
+    WEDGE_FAILURES = 3
 
     def __init__(self, openai_service, emit_idle=None, phase_emitter=None,
                  input_buffer=None, **kwargs):
@@ -198,12 +215,22 @@ class ConnectionRecovery(FrameProcessor):
         # possible "is anyone interacting?" signal (the device only streams the
         # mic during an active turn or the follow-up window).
         self._last_input_audio = time.monotonic()
-        self._refresh_task = None
+        self._health_task = None
+        # Health-probe state: when the session was FIRST seen disconnected
+        # (None = currently healthy), and how many recoveries failed in a row.
+        self._dead_since = None
+        self._consecutive_failures = 0
+        self._wedge_logged = False
+        # Set on EndFrame/CancelFrame (and by cleanup()) so a torn-down pipeline
+        # can't keep probing — and reconnecting — a service nobody is using.
+        self._stopped = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        if self._refresh_task is None:
-            self._refresh_task = asyncio.create_task(self._proactive_refresh_loop())
+        if isinstance(frame, (EndFrame, CancelFrame)):
+            self._stopped = True
+        if self._health_task is None and not self._stopped:
+            self._health_task = asyncio.create_task(self._health_loop())
         if isinstance(frame, InputAudioRawFrame):
             if self._input_buffer is not None:
                 self._input_buffer.note_audio(len(frame.audio), frame.sample_rate)
@@ -272,20 +299,36 @@ class ConnectionRecovery(FrameProcessor):
                 return
             await reset()
             self._connected_at = time.monotonic()
+            self._consecutive_failures = 0
+            self._wedge_logged = False
+            self._dead_since = None
             logger.info(
                 f"✅ OpenAI Realtime session reconnected in {self._connected_at - t0:.1f}s "
                 f"(gap the user may have heard)"
             )
         except Exception as e:
+            self._consecutive_failures += 1
             logger.error(f"❌ OpenAI reconnect attempt failed: {e!r}")
+            if self._consecutive_failures >= self.WEDGE_FAILURES and not self._wedge_logged:
+                self._wedge_logged = True
+                logger.error(
+                    f"REALTIME_SESSION_WEDGED after {self._consecutive_failures} consecutive "
+                    f"failed reconnects — the OpenAI session is dead and not recovering; "
+                    f"last error: {e!r}"
+                )
         finally:
             self._reconnecting = False
 
-    async def _proactive_refresh_loop(self):
-        """Refresh the OpenAI session BEFORE the 60-min cap, during real idle.
+    async def _health_loop(self):
+        """Background tick: session health probe + proactive pre-cap refresh.
 
-        The cap reconnect is recoverable (~3 s), but when it lands
-        mid-conversation that turn hiccups. Refreshing proactively while
+        Probe: if the service has no websocket (or never became
+        api-session-ready) continuously for HEALTH_DEAD_S, the session is a
+        zombie — nothing will produce another ErrorFrame to trigger the reactive
+        path — so force a recovery.
+
+        Refresh: the 60-min cap reconnect is recoverable (~3 s), but when it
+        lands mid-conversation that turn hiccups. Refreshing proactively while
         nothing is happening means users practically never meet the cap.
         "Quiet" is double-checked: no assistant response in flight AND no mic
         audio for REFRESH_QUIET_S — so it can never fire during a turn, a
@@ -294,9 +337,29 @@ class ConnectionRecovery(FrameProcessor):
         while True:
             try:
                 await asyncio.sleep(self.REFRESH_CHECK_S)
+                if self._stopped:
+                    return
                 if self._reconnecting:
                     continue
                 now = time.monotonic()
+                # --- health probe ---
+                ws = getattr(self._service, "_websocket", None)
+                ready = getattr(self._service, "_api_session_ready", True)
+                if ws is None or ready is False:
+                    if self._dead_since is None:
+                        self._dead_since = now
+                    dead_for = now - self._dead_since
+                    if (dead_for >= self.HEALTH_DEAD_S
+                            and now - self._last_attempt >= self.RECONNECT_COOLDOWN_S):
+                        self._reconnecting = True
+                        self._last_attempt = now
+                        self._dead_since = None
+                        await self._recover(
+                            f"health probe: OpenAI session not connected for {dead_for:.0f}s"
+                        )
+                        continue
+                else:
+                    self._dead_since = None
                 age = now - self._connected_at
                 quiet = now - self._last_input_audio
                 busy = getattr(self._service, "_current_assistant_response", None) is not None
@@ -313,6 +376,21 @@ class ConnectionRecovery(FrameProcessor):
                 raise
             except Exception as e:
                 logger.warning(f"⚠️ proactive refresh loop error: {e!r}")
+
+    async def cleanup(self):
+        """Stop the health loop when the pipeline is torn down."""
+        await super().cleanup()
+        self._stopped = True
+        task = self._health_task
+        self._health_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(f"⚠️ health loop teardown error: {e!r}")
 
     async def _go_idle(self, reason: str) -> None:
         """Put the device in idle for a dead turn — via PhaseEmitter when wired."""

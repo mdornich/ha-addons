@@ -101,8 +101,46 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
         server-VAD drives every user-turn response, so we never need to create one
         ourselves on reconnect. The live context is untouched (it's restored by the
         SessionManager on the next real turn).
+
+        Second reason this is a full reimplementation rather than a `super()`
+        call: pipecat's reset_conversation() does `_disconnect()` →
+        `_process_completed_function_calls(...)` → `_connect()`, and that middle
+        step dereferences `self._context.get_messages()`. `self._context` starts
+        as None and is only set by `_handle_context` on the first real turn — and
+        the startup pre-seed below only ran under semantic_vad, while the live
+        config runs server_vad. The pipeline is built ONCE per add-on process,
+        so the None-context window runs from add-on start until the first real
+        turn — every start, restart and update, and it catches any OpenAI drop,
+        60-min cap or proactive refresh that lands inside it. A reconnect in that
+        window raised
+        `AttributeError: 'NoneType' has no attribute 'get_messages'` AFTER the
+        disconnect and BEFORE the reconnect. ConnectionRecovery caught it, logged
+        "❌ OpenAI reconnect attempt failed", and every retry hit the same wall:
+        the session stayed dead forever (wake chime, then silence; only an add-on
+        restart recovered it). Here we pre-seed an empty context when it's None,
+        never let the function-call replay abort the reconnect, and always
+        `_connect()` in a `finally`.
         """
-        await super().reset_conversation()
+        await self._disconnect()
+        self._llm_needs_conversation_setup = True
+        try:
+            if getattr(self, "_context", None) is None:
+                from pipecat.processors.aggregators.llm_context import LLMContext
+                self._context = LLMContext()
+                logger.info(
+                    "🌱 reset_conversation: no context yet (server_vad, pre-first-turn) — "
+                    "pre-seeded an empty LLMContext instead of crashing the reconnect"
+                )
+            else:
+                try:
+                    await self._process_completed_function_calls(send_new_results=False)
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ reset_conversation: function-call replay failed, "
+                        f"continuing to reconnect: {e!r}"
+                    )
+        finally:
+            await self._connect()
         try:
             self._run_llm_when_api_session_ready = False
             self._llm_needs_conversation_setup = False
@@ -776,30 +814,43 @@ class Application:
         # create_response=True), and there's no double — AND no startup speech.
         # The empty sentinel is harmlessly overwritten by the real context on the
         # first turn (both branches do `self._context = context`).
-        if self.turn_detection_type == "semantic_vad" and self.semantic_vad_create_response:
-            try:
-                from pipecat.processors.aggregators.llm_context import LLMContext
-                if self.openai_service is not None and getattr(self.openai_service, "_context", None) is None:
-                    self.openai_service._context = LLMContext()
-                    # Also mark pipecat's one-time "conversation setup" as already
-                    # done. pipecat runs it on the FIRST _create_response: it
-                    # re-sends the context's messages as ConversationItemCreate
-                    # events, then flips _llm_needs_conversation_setup False. On a
-                    # fresh realtime session OpenAI already builds the conversation
-                    # from the live audio + tool-call flow, so that one-time setup
-                    # re-injects items OpenAI already has — which made the first
-                    # post-tool reply come out as a meaningless filler ("Ik ben
-                    # klaar om verder te gaan met het gesprek."). Instructions are
-                    # sent independently via _update_settings() on session.created,
-                    # so clearing this flag is safe and makes the first real turn a
-                    # normal reply.
-                    if hasattr(self.openai_service, "_llm_needs_conversation_setup"):
-                        self.openai_service._llm_needs_conversation_setup = False
+        #
+        # The context pre-seed itself now runs for EVERY turn-detection mode, not
+        # just semantic_vad: a None `_context` is also the thing that made
+        # pipecat's reset_conversation() raise mid-reconnect and wedge the session
+        # permanently (see SafeRealtimeLLMService.reset_conversation above). Under
+        # server_vad the sentinel is equally harmless — `create_response` is left
+        # unset there, which OpenAI defaults to true, so the server still creates
+        # turn 1's response. Only the `_llm_needs_conversation_setup = False` part
+        # stays gated on semantic_vad + create_response, exactly as before.
+        _seed_setup_flag = (
+            self.turn_detection_type == "semantic_vad" and self.semantic_vad_create_response
+        )
+        try:
+            from pipecat.processors.aggregators.llm_context import LLMContext
+            if self.openai_service is not None and getattr(self.openai_service, "_context", None) is None:
+                self.openai_service._context = LLMContext()
+                # Also mark pipecat's one-time "conversation setup" as already
+                # done. pipecat runs it on the FIRST _create_response: it
+                # re-sends the context's messages as ConversationItemCreate
+                # events, then flips _llm_needs_conversation_setup False. On a
+                # fresh realtime session OpenAI already builds the conversation
+                # from the live audio + tool-call flow, so that one-time setup
+                # re-injects items OpenAI already has — which made the first
+                # post-tool reply come out as a meaningless filler ("Ik ben
+                # klaar om verder te gaan met het gesprek."). Instructions are
+                # sent independently via _update_settings() on session.created,
+                # so clearing this flag is safe and makes the first real turn a
+                # normal reply. Kept gated on semantic_vad + create_response.
+                if _seed_setup_flag and hasattr(self.openai_service, "_llm_needs_conversation_setup"):
+                    self.openai_service._llm_needs_conversation_setup = False
                     logger.info("🌱 Pre-seeded empty context + marked conversation setup done (no startup speech, no first-turn filler)")
                 else:
-                    logger.info("🌱 Startup context already set; skipping pre-seed")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not pre-seed startup context (turn-1 double may occur): {e}")
+                    logger.info("🌱 Pre-seeded empty context (reconnect-safe sentinel; conversation-setup flag left as-is)")
+            else:
+                logger.info("🌱 Startup context already set; skipping pre-seed")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not pre-seed startup context (turn-1 double may occur): {e}")
 
         # Setup WebSocket event handlers
         async def on_client_connected(client_id: str):

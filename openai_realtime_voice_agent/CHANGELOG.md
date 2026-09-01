@@ -2,6 +2,27 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.7.5
+
+- **The reconnect that could never succeed.** pipecat's `reset_conversation()`
+  disconnects, then replays completed function calls via
+  `self._context.get_messages()`, then reconnects — but `_context` is None until
+  the first real turn and our startup pre-seed only ran under semantic_vad while
+  the live config runs server_vad. The pipeline is built once per add-on
+  process, so from every add-on start until the first real turn any connection
+  death — a drop, the 60-min cap, the proactive refresh — raised
+  `AttributeError` between the disconnect and the reconnect, and every retry hit
+  the same wall (wake chime, then silence, until the add-on was restarted). `SafeRealtimeLLMService` now reimplements the reset:
+  it pre-seeds an empty context when there is none, never lets the replay abort
+  the reconnect, and always reconnects in a `finally`. The startup pre-seed also
+  runs for every turn-detection mode now.
+- **A dead session can no longer hide.** The background loop is now a health
+  loop: if the OpenAI session has had no websocket (or never became
+  api-session-ready) for 20 s it forces a recovery on its own — the reactive path
+  needs ErrorFrames, and a silently absent session produces none. After three
+  consecutive failed reconnects the log carries one `REALTIME_SESSION_WEDGED`
+  line with the last error, so a zombie add-on is greppable instead of invisible.
+
 ## 0.7.3
 
 - **`ask_dex` now has a server to talk to, and authenticates to it.** 980labsOS
