@@ -1,0 +1,12 @@
+# Docker's .dockerignore patterns are NOT implicitly recursive: `__pycache__/`
+# alone matches only the context root, which is why 0.7.5's image shipped
+# app/__pycache__ full of host CPython 3.12 bytecode into a 3.11 image.
+__pycache__/
+**/__pycache__/
+*.pyc
+**/*.pyc
+.pytest_cache/
+**/.pytest_cache/
+.ruff_cache/
+**/.ruff_cache/
+tests/

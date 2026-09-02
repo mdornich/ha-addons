@@ -33,8 +33,10 @@ The tracker is pure and clock-injectable: no pipecat, no websockets, no OpenAI.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
+from array import array
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,21 @@ DEFAULT_MIN_COMMIT_MS = 600.0
 # ~100 ms of audio ("buffer too small"), which surfaces as an error event and
 # no reply. Never send a commit under this, whatever the speech count says.
 MIN_COMMITTABLE_AUDIO_MS = 100.0
+
+# Frame RMS (int16 scale) at or above which a frame is counted as "speech-like
+# audio". 500 is about -36 dBFS: comfortably above a quiet room's noise floor
+# and far below normal speech into the puck's mic. This counter is deliberately
+# INDEPENDENT of OpenAI's server VAD — the whole point of the 2026-09-01 21:04
+# diagnostic is to tell "the puck streamed near-silence" apart from "the puck
+# streamed real speech and OpenAI's VAD ignored it".
+LOUD_FRAME_RMS = 500.0
+
+
+def _dbfs(value: float) -> str:
+    """int16-scale amplitude as dBFS, or '-inf' at (or below) zero."""
+    if value <= 0:
+        return "-inf"
+    return f"{20.0 * math.log10(value / 32768.0):.1f}"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -93,19 +110,59 @@ class InputBufferTracker:
     speaking: bool = False
     _last_speech_stop: float | None = None
 
+    # Level accounting (2026-09-01): peak/RMS/loud-ms over everything appended
+    # since the last commit or clear.
+    peak: int = 0
+    sum_sq: float = 0.0
+    n_samples: int = 0
+    loud_ms: float = 0.0
+
     # ----------------------------------------------------------------- inputs
-    def note_audio(self, num_bytes: int, sample_rate: int) -> None:
-        """One PCM16 mono frame arrived from the device."""
+    def note_audio(
+        self, num_bytes: int, sample_rate: int, pcm: bytes | None = None
+    ) -> None:
+        """One PCM16 mono frame arrived from the device.
+
+        `pcm` is the frame's raw bytes. When given, the frame's level is folded
+        into the peak/RMS/loud-ms counters. Frames are 20-60 ms, so an
+        `array('h')` pass is a few hundred samples — cheap enough per frame and
+        free of a numpy dependency.
+        """
         if num_bytes <= 0 or sample_rate <= 0:
             return
         ms = (num_bytes / 2.0) / sample_rate * 1000.0
         self.audio_ms += ms
         if self.speaking:
             self.speech_ms += ms
+        if pcm:
+            self._note_level(pcm, ms)
+
+    def _note_level(self, pcm: bytes, ms: float) -> None:
+        try:
+            samples = array("h")
+            samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+        except ValueError:  # pragma: no cover - defensive
+            return
+        if not samples:
+            return
+        frame_peak = 0
+        frame_sum_sq = 0.0
+        for sample in samples:
+            magnitude = -sample if sample < 0 else sample
+            if magnitude > frame_peak:
+                frame_peak = magnitude
+            frame_sum_sq += float(sample) * float(sample)
+        if frame_peak > self.peak:
+            self.peak = frame_peak
+        self.sum_sq += frame_sum_sq
+        self.n_samples += len(samples)
+        if math.sqrt(frame_sum_sq / len(samples)) >= LOUD_FRAME_RMS:
+            self.loud_ms += ms
 
     def note_speech_started(self) -> None:
         """Server VAD heard the user start. From here, audio counts as speech."""
         self.speaking = True
+        logger.info(f"🎚️ VAD speech_started — level so far: {self.level_summary()}")
 
     def note_speech_stopped(self) -> None:
         """Server VAD heard the user stop — a server commit follows."""
@@ -124,14 +181,38 @@ class InputBufferTracker:
         if self.speech_ms or self.audio_ms:
             logger.debug(
                 f"📏 input buffer reset on {why} "
-                f"(was {self.speech_ms:.0f} ms speech / {self.audio_ms:.0f} ms audio)"
+                f"(was {self.speech_ms:.0f} ms speech / {self.audio_ms:.0f} ms audio; "
+                f"level {self.level_summary()})"
             )
         self.speech_ms = 0.0
         self.audio_ms = 0.0
         self.speaking = False
         self._last_speech_stop = None
+        self.peak = 0
+        self.sum_sq = 0.0
+        self.n_samples = 0
+        self.loud_ms = 0.0
 
     # ---------------------------------------------------------------- queries
+    def rms(self) -> float:
+        """int16-scale RMS over everything appended since the last reset."""
+        if self.n_samples <= 0:
+            return 0.0
+        return math.sqrt(self.sum_sq / self.n_samples)
+
+    def level_summary(self) -> str:
+        """Human-readable level line for the logs.
+
+        e.g. the cut-off log tail `level peak=1234 (-28.5 dBFS) rms=210
+        (-43.9 dBFS) loud=840ms/10000ms`
+        """
+        rms = self.rms()
+        return (
+            f"peak={self.peak} ({_dbfs(self.peak)} dBFS) "
+            f"rms={rms:.0f} ({_dbfs(rms)} dBFS) "
+            f"loud={self.loud_ms:.0f}ms/{self.audio_ms:.0f}ms"
+        )
+
     def speaking_recently(self) -> bool:
         """Mid-utterance, or within the grace window after the VAD's stop."""
         if self.speaking:
@@ -143,21 +224,27 @@ class InputBufferTracker:
     def decide_cutoff(self) -> CutoffDecision:
         """Commit-or-clear for a follow-up window that just expired."""
         speech_ms, audio_ms = self.speech_ms, self.audio_ms
+        # Every branch carries the level summary: when the VAD never fired, the
+        # only way to tell a muted/ducked mic apart from a VAD miss is the level
+        # of what the puck actually streamed (2026-09-01 21:04).
+        level = f"; level {self.level_summary()}"
+
+        def decide(commit: bool, reason: str) -> CutoffDecision:
+            return CutoffDecision(commit, reason + level, speech_ms, audio_ms)
+
         if audio_ms < MIN_COMMITTABLE_AUDIO_MS:
-            return CutoffDecision(
-                False, f"buffer effectively empty ({audio_ms:.0f} ms audio)",
-                speech_ms, audio_ms)
+            return decide(False, f"buffer effectively empty ({audio_ms:.0f} ms audio)")
         if self.speaking:
-            return CutoffDecision(
-                True, "user was still speaking at the cut-off", speech_ms, audio_ms)
+            return decide(True, "user was still speaking at the cut-off")
         if speech_ms >= self.min_commit_ms:
-            return CutoffDecision(
-                True, f"{speech_ms:.0f} ms of speech uncommitted "
-                      f"(>= {self.min_commit_ms:.0f} ms)",
-                speech_ms, audio_ms)
+            return decide(
+                True,
+                f"{speech_ms:.0f} ms of speech uncommitted "
+                f"(>= {self.min_commit_ms:.0f} ms)",
+            )
         if self.speaking_recently():
-            return CutoffDecision(
-                True, "speech ended inside the grace window", speech_ms, audio_ms)
-        return CutoffDecision(
-            False, f"only {speech_ms:.0f} ms of speech (< {self.min_commit_ms:.0f} ms)",
-            speech_ms, audio_ms)
+            return decide(True, "speech ended inside the grace window")
+        return decide(
+            False,
+            f"only {speech_ms:.0f} ms of speech (< {self.min_commit_ms:.0f} ms)",
+        )

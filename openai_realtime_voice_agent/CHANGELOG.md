@@ -2,6 +2,21 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.7.6
+
+- **We can finally see whether the puck was streaming anything.** 2026-09-01
+  21:04: the first turn answered, then the follow-up question spoken inside the
+  10 s window never became a turn —
+  `🧽 follow-up cut-off → ... only 0 ms of speech (< 600 ms)` with a full window
+  of audio in the buffer. Same signature 08-30 21:37 and 08-31 09:53. That line
+  could not tell a mic whose gain was never restored after playback apart from
+  real speech OpenAI's server VAD ignored, and there is no shell on the HA host
+  to pull a recording. So the tracker now measures the audio itself — peak, RMS
+  (both int16 scale and dBFS) and `loud` ms of frames at or above ~-36 dBFS,
+  a speech-like-audio count that owes nothing to the VAD — and every cut-off
+  reason carries it. `speech_started` logs the same summary, so a detected
+  utterance gives us the reference level to compare a missed one against.
+
 ## 0.7.5
 
 - **The reconnect that could never succeed.** pipecat's `reset_conversation()`

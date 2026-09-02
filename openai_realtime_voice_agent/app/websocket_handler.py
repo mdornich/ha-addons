@@ -233,7 +233,9 @@ class ConnectionRecovery(FrameProcessor):
             self._health_task = asyncio.create_task(self._health_loop())
         if isinstance(frame, InputAudioRawFrame):
             if self._input_buffer is not None:
-                self._input_buffer.note_audio(len(frame.audio), frame.sample_rate)
+                self._input_buffer.note_audio(
+                    len(frame.audio), frame.sample_rate, frame.audio
+                )
             # Also kept for the proactive-refresh "is anyone interacting?" check.
             # (Stale-audio clearing is now done at the cut-off source — the device
             # sends {"type":"flush"} when a follow-up window times out — not
