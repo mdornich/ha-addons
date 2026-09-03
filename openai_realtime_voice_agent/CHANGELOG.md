@@ -2,6 +2,32 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.7.7
+
+- **A stuck "the user is still speaking" flag, unstuck at the bot-reply
+  boundary.** 2026-09-02 21:38: "Hey Trixie, can you pause the media room?" was
+  transcribed at 21:38:20,693 and 9 ms later logged `🎚️ VAD speech_started` —
+  pipecat's EMULATED UserStartedSpeaking, synthesised from the transcript rather
+  than a server VAD event. Its matching stop never reached the tracker, because
+  the PhaseEmitter swallowed it at 21:38:21,506
+  (`📞 'thinking' suppressed — bot is replying (stale VAD tail)`). So
+  `InputBufferTracker.speaking` stayed True through a silent 10 s follow-up
+  window and 21:38:34 read it as
+  `🗣️ follow-up cut-off → ... (user was still speaking at the cut-off; level ...
+  loud=1952ms/11200ms)`. The tracker now takes the start of the bot's reply as a
+  hard turn boundary and resets there, and that stale-tail suppression — which
+  is about the LED, not about buffer accounting — still tells the tracker the
+  user's turn ended.
+
+- **No more answering a commit that had nothing in it.** The same cut-off sent
+  `input_audio_buffer.commit` and `response.create` back to back; OpenAI replied
+  `⚠️ benign realtime error ignored: input_audio_buffer_commit_empty` and the
+  orphan response said "Goodbye, Mitch." to an empty room. The commit now waits
+  up to 1.5 s to learn its own outcome — `input_audio_buffer.committed` means a
+  real turn and gets its `response.create`, an empty commit or no answer at all
+  logs `🧽 follow-up cut-off → commit was empty, no response requested` and
+  closes the turn instead of speaking into the dark.
+
 ## 0.7.6
 
 - **We can finally see whether the puck was streaming anything.** 2026-09-01

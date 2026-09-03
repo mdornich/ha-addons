@@ -828,11 +828,19 @@ class WebSocketHandler:
             input_buffer.note_speech_stopped()
             input_buffer.note_commit("server VAD end-of-turn")
 
+        def _bot_started():
+            # Hard turn boundary: the reply is playing, so whatever the user
+            # said is committed (or gone) and the mic is gated. Clears the
+            # `speaking` flag an emulated-VAD turn can otherwise leave stuck —
+            # see app/input_buffer.py:note_bot_started (2026-09-02 21:38).
+            input_buffer.note_bot_started()
+
         phase_emitter.set_kill_window_handlers(
             on_dangling=lambda: _interrupt_kill_until.__setitem__(
                 "t", time.monotonic() + INTERRUPT_KILL_WINDOW_S),
             on_real_speech=_clear_kill_window,
             on_speech_stopped=_speech_stopped,
+            on_bot_started=_bot_started,
         )
 
         if self._serializer is not None:

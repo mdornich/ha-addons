@@ -180,6 +180,10 @@ class PhaseEmitter(FrameProcessor):
         # to know the input buffer has just been committed by the server —
         # see app/input_buffer.py.
         self._on_speech_stopped = None
+        # Called when the bot starts speaking. The follow-up cut-off's input
+        # buffer tracker uses it as a hard turn boundary — see
+        # app/input_buffer.py:note_bot_started (2026-09-02 21:38).
+        self._on_bot_started = None
 
     def note_wake(self) -> None:
         """Device woke (or a follow-up window closed without speech). Until the
@@ -194,15 +198,18 @@ class PhaseEmitter(FrameProcessor):
             self._follow_up_chain.note_wake()
 
     def set_kill_window_handlers(self, on_dangling=None, on_real_speech=None,
-                                 on_speech_stopped=None) -> None:
+                                 on_speech_stopped=None, on_bot_started=None) -> None:
         """Wire the dangling-VAD guard to the websocket_handler kill-window.
 
         `on_speech_stopped` is not part of that guard: it fires on a real
         end-of-utterance so the input-buffer tracker knows the server committed.
+        `on_bot_started` likewise: it fires when the reply starts, the hard
+        turn boundary the input-buffer tracker resets on.
         """
         self._on_dangling_stop = on_dangling
         self._on_real_speech = on_real_speech
         self._on_speech_stopped = on_speech_stopped
+        self._on_bot_started = on_bot_started
 
     async def force_idle(self, reason: str = "") -> None:
         """Declare the current turn dead and put the device in idle.
@@ -350,6 +357,13 @@ class PhaseEmitter(FrameProcessor):
                 # (the TTS leaks in) and strand the LED in `thinking` until the
                 # 15 s watchdog. Keep replying.
                 logger.info("📞 'thinking' suppressed — bot is replying (stale VAD tail)")
+                # The suppression is about the LED, not about buffer accounting.
+                # Swallowing this stop entirely left InputBufferTracker.speaking
+                # stuck True for the whole follow-up window (2026-09-02 21:38:21
+                # → an empty commit and "Goodbye, Mitch." to an empty room), so
+                # the tracker still learns the user's turn ended here.
+                if self._on_speech_stopped is not None:
+                    self._on_speech_stopped()
             elif not self._speech_since_wake:
                 # A: no real speech since the last wake/flush → this stop is a
                 # dangling pre-wake server-VAD segment closing late. Suppress the
@@ -369,6 +383,8 @@ class PhaseEmitter(FrameProcessor):
                 self._arm_watchdog()
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._suppress_thinking = False
+            if self._on_bot_started is not None:
+                self._on_bot_started()
             self._cancel_pending_idle()
             self._cancel_watchdog()
             await self._emit("replying")

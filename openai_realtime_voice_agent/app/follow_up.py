@@ -7,11 +7,20 @@ imports only the OpenAI Realtime event models, so it is unit-testable with a
 mocked service.
 """
 
+import asyncio
 import logging
 
 from pipecat.services.openai.realtime import events as openai_rt_events
 
 logger = logging.getLogger(__name__)
+
+# How long to wait for OpenAI to say whether our commit had anything in it
+# (`input_audio_buffer.committed` vs an `input_audio_buffer_commit_empty`
+# error). Both come back on the same socket in well under a round-trip; 1.5 s
+# is generous. On a timeout we do NOT ask for a response — an unanswered
+# follow-up is a quiet room, and the failure this replaces was the assistant
+# talking to one.
+COMMIT_ACK_TIMEOUT_S = 1.5
 
 
 async def handle_follow_up_cutoff(openai_service, input_buffer, phase_emitter) -> bool:
@@ -31,13 +40,43 @@ async def handle_follow_up_cutoff(openai_service, input_buffer, phase_emitter) -
 
     `InputBufferTracker` tells the two apart by SPEECH milliseconds since the
     last commit — silence does not count, because the mic streams for the whole
-    window. Returns True when the buffer was committed, False when cleared.
+    window. Returns True ONLY when a response was actually requested: a commit
+    the server reports empty (or never acknowledges) returns False, like a
+    clear, because no turn is in flight.
     """
     decision = input_buffer.decide_cutoff()
     if decision.commit:
         try:
+            outcome = None
+            expect = getattr(openai_service, "expect_commit_outcome", None)
+            if expect is not None:
+                outcome = expect()
             await openai_service.send_client_event(
                 openai_rt_events.InputAudioBufferCommitEvent())
+            # Do NOT create a response until we know the commit carried audio.
+            # 2026-09-02 21:38:34 shipped commit+response.create back to back
+            # on a buffer the server considered empty; the commit came back
+            # `input_audio_buffer_commit_empty` and the orphan response.create
+            # answered it with "Goodbye, Mitch." into an empty room.
+            committed = True
+            if outcome is not None:
+                try:
+                    committed = await asyncio.wait_for(
+                        outcome, timeout=COMMIT_ACK_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    committed = False
+                    logger.info(
+                        "⏱️ follow-up cut-off → no commit ack in "
+                        f"{COMMIT_ACK_TIMEOUT_S:.1f}s — treating it as empty"
+                    )
+            if not committed:
+                input_buffer.note_clear("follow-up cut-off (commit was empty)")
+                phase_emitter.note_wake()
+                logger.info(
+                    "🧽 follow-up cut-off → commit was empty, no response "
+                    f"requested ({decision.reason})"
+                )
+                return False
             await openai_service.send_client_event(
                 openai_rt_events.ResponseCreateEvent())
             input_buffer.note_commit("follow-up cut-off")

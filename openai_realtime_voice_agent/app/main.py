@@ -55,6 +55,36 @@ def _resolve_choice(env_var: str, custom_env_var: str, default: str) -> str:
 dotenv.load_dotenv()
 
 
+class _EventSniffingSocket:
+    """Read-only tee on the realtime websocket's inbound message stream.
+
+    pipecat 0.0.97's `_receive_task_handler` dispatches server events by type
+    through an if/elif chain, and `input_audio_buffer.committed` is not in it —
+    there is no handler to override. Everything else about that loop is worth
+    keeping, so instead of forking it we hand it an object that iterates the
+    real socket and shows each raw message to a callback on the way past.
+    Every other attribute (send, close, …) delegates untouched.
+    """
+
+    def __init__(self, websocket, on_message):
+        self._websocket = websocket
+        self._on_message = on_message
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        async for message in self._websocket:
+            try:
+                self._on_message(message)
+            except Exception as e:  # pragma: no cover - a sniff must never kill the loop
+                logger.debug(f"event sniff failed, ignoring: {e!r}")
+            yield message
+
+    def __getattr__(self, name):
+        return getattr(self._websocket, name)
+
+
 class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
     """OpenAIRealtimeLLMService with audio-truncation-on-interruption disabled.
 
@@ -183,12 +213,46 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
         if await super()._maybe_handle_evt_retrieve_conversation_item_error(evt):
             return True
         code = getattr(getattr(evt, "error", None), "code", None)
+        if code == "input_audio_buffer_commit_empty":
+            # The commit we just sent had nothing in it. Whoever is waiting on
+            # the outcome must NOT go on to ask for a response (2026-09-02
+            # 21:38: it produced "Goodbye, Mitch." to an empty room).
+            self.resolve_commit_outcome(False)
         if code in self.BENIGN_ERROR_CODES:
             logger.warning(
                 f"⚠️ benign realtime error ignored (session stays alive): {code}"
             )
             return True
         return False
+
+    # ------------------------------------------------------------- commit ack
+    # Did the `input_audio_buffer.commit` we just sent actually contain audio?
+    # OpenAI answers either way — `input_audio_buffer.committed` on success, an
+    # `input_audio_buffer_commit_empty` error on an empty buffer — but pipecat
+    # 0.0.97 has no handler for the success event and treats the error as
+    # merely benign. Callers that must not blindly `response.create` after a
+    # commit (app/follow_up.py) arm a future here and await the answer.
+    _commit_outcome = None
+
+    def expect_commit_outcome(self):
+        """Arm a future resolved True on `committed`, False on `commit_empty`."""
+        future = asyncio.get_running_loop().create_future()
+        self._commit_outcome = future
+        return future
+
+    def resolve_commit_outcome(self, committed: bool) -> None:
+        future, self._commit_outcome = self._commit_outcome, None
+        if future is not None and not future.done():
+            future.set_result(committed)
+
+    def _sniff_server_event(self, message) -> None:
+        """Raw inbound message tee — see `_EventSniffingSocket`."""
+        if self._commit_outcome is None:
+            return
+        if isinstance(message, (bytes, bytearray)):
+            message = message.decode("utf-8", "ignore")
+        if isinstance(message, str) and '"input_audio_buffer.committed"' in message:
+            self.resolve_commit_outcome(True)
 
     def register_function(self, function_name, handler, start_callback=None, *,
                           cancel_on_interruption: bool = True):  # type: ignore[override]
@@ -236,6 +300,9 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
         Wrap the loop and report its end; ConnectionRecovery treats the
         message as a reconnect trigger.
         """
+        real_socket = getattr(self, "_websocket", None)
+        if real_socket is not None and not isinstance(real_socket, _EventSniffingSocket):
+            self._websocket = _EventSniffingSocket(real_socket, self._sniff_server_event)
         try:
             await super()._receive_task_handler()
         except asyncio.CancelledError:

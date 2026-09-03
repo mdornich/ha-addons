@@ -169,6 +169,36 @@ class InputBufferTracker:
         self.speaking = False
         self._last_speech_stop = self.clock()
 
+    def note_bot_started(self) -> None:
+        """The bot began replying: the user's turn is over and the buffer empty.
+
+        WHY (2026-09-02 21:38, add-on 0.7.6). A wake-word turn ran to completion
+        — transcript, house call, "Paused." — but the tracker was left with
+        `speaking = True` for the whole following follow-up window, because the
+        UserStartedSpeaking that set it was pipecat's EMULATED frame (synthesised
+        from the transcription, not a server VAD event) and its matching
+        UserStoppedSpeaking was swallowed by the PhaseEmitter's stale-VAD-tail
+        suppression, so `note_speech_stopped` never ran:
+
+            21:38:20,693  🎚️ VAD speech_started
+            21:38:21,506  📞 'thinking' suppressed — bot is replying (stale VAD tail)
+
+        Ten seconds of an empty room later, `decide_cutoff` still read "user was
+        still speaking at the cut-off", committed an empty buffer, and the bot
+        said "Goodbye, Mitch." to nobody.
+
+        This is a FULL `_reset`, not just a `speaking = False`. Once the bot is
+        replying, the server has already committed (or the turn was cancelled)
+        and — with barge_in false — the mic is gated, so nothing appended before
+        this moment is still sitting in OpenAI's buffer. Keeping the ms/level
+        counters would be strictly worse than resetting them: `decide_cutoff`'s
+        second branch commits on `speech_ms >= min_commit_ms`, so a retained
+        pre-reply speech count would produce exactly the same empty commit by a
+        different route. Everything appended AFTER this call is what the next
+        cut-off decision should be made from, which is what a reset gives.
+        """
+        self._reset("bot reply started")
+
     def note_commit(self, reason: str = "") -> None:
         """The buffer was committed (by the server VAD or by us): it is empty."""
         self._reset(f"commit ({reason})" if reason else "commit")
