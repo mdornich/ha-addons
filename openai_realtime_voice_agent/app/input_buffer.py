@@ -60,6 +60,11 @@ MIN_COMMITTABLE_AUDIO_MS = 100.0
 # streamed real speech and OpenAI's VAD ignored it".
 LOUD_FRAME_RMS = 500.0
 
+# How many one-second buckets of the level profile to keep/render. A follow-up
+# window is ~10 s; 30 covers the longest window we would ever open without the
+# log line growing without bound.
+PROFILE_MAX_BUCKETS = 30
+
 
 def _dbfs(value: float) -> str:
     """int16-scale amplitude as dBFS, or '-inf' at (or below) zero."""
@@ -117,6 +122,23 @@ class InputBufferTracker:
     n_samples: int = 0
     loud_ms: float = 0.0
 
+    # Time profile (2026-09-02 23:02): per-second peak since the last reset, and
+    # when the first speech-like frame arrived. Totals alone could not tell
+    # "the mic was quiet for the whole window" apart from "the mic was quiet for
+    # the first three seconds while the puck's echo canceller was still ducking,
+    # and the user happened to speak inside that dead zone" — which is exactly
+    # what the 23:02 cut-off looked like:
+    #   🧽 follow-up cut-off → ... only 0 ms of speech; level peak=3541
+    #   (-19.3 dBFS) rms=494 (-36.4 dBFS) loud=2896ms/9984ms
+    # A ~3 s sentence was spoken in that window and arrived 18 dB below the wake
+    # turn (peak=29172, -1.0 dBFS). WHEN in the window it landed is the question
+    # the totals cannot answer; this is the answer.
+    #
+    # Bucketing is by ACCUMULATED audio_ms, not wall clock, so the profile is a
+    # deterministic function of the frames fed in and therefore testable.
+    bucket_peaks: list[int] = field(default_factory=list)
+    first_loud_at_ms: float | None = None
+
     # ----------------------------------------------------------------- inputs
     def note_audio(
         self, num_bytes: int, sample_rate: int, pcm: bytes | None = None
@@ -131,13 +153,14 @@ class InputBufferTracker:
         if num_bytes <= 0 or sample_rate <= 0:
             return
         ms = (num_bytes / 2.0) / sample_rate * 1000.0
+        offset_ms = self.audio_ms  # where this frame STARTS, for the profile
         self.audio_ms += ms
         if self.speaking:
             self.speech_ms += ms
         if pcm:
-            self._note_level(pcm, ms)
+            self._note_level(pcm, ms, offset_ms)
 
-    def _note_level(self, pcm: bytes, ms: float) -> None:
+    def _note_level(self, pcm: bytes, ms: float, offset_ms: float) -> None:
         try:
             samples = array("h")
             samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
@@ -158,6 +181,16 @@ class InputBufferTracker:
         self.n_samples += len(samples)
         if math.sqrt(frame_sum_sq / len(samples)) >= LOUD_FRAME_RMS:
             self.loud_ms += ms
+            if self.first_loud_at_ms is None:
+                self.first_loud_at_ms = offset_ms
+        # One bucket per elapsed second of appended audio, holding that second's
+        # peak. Cheap: a list of ints and one compare per frame.
+        bucket = int(offset_ms // 1000.0)
+        if bucket < PROFILE_MAX_BUCKETS:
+            while len(self.bucket_peaks) <= bucket:
+                self.bucket_peaks.append(0)
+            if frame_peak > self.bucket_peaks[bucket]:
+                self.bucket_peaks[bucket] = frame_peak
 
     def note_speech_started(self) -> None:
         """Server VAD heard the user start. From here, audio counts as speech."""
@@ -222,6 +255,8 @@ class InputBufferTracker:
         self.sum_sq = 0.0
         self.n_samples = 0
         self.loud_ms = 0.0
+        self.bucket_peaks = []
+        self.first_loud_at_ms = None
 
     # ---------------------------------------------------------------- queries
     def rms(self) -> float:
@@ -230,17 +265,38 @@ class InputBufferTracker:
             return 0.0
         return math.sqrt(self.sum_sq / self.n_samples)
 
+    def profile_summary(self) -> str:
+        """Per-second peak profile, one integer dBFS per elapsed second.
+
+        e.g. `profile(dBFS/s)=[-37,-36,-19,-20,-21,-35,-36,-36,-36,-36]` — a
+        window whose speech landed in seconds 2-4 and nowhere else.
+        """
+        cells = []
+        for peak in self.bucket_peaks[:PROFILE_MAX_BUCKETS]:
+            if peak <= 0:
+                cells.append("-inf")
+            else:
+                cells.append(f"{20.0 * math.log10(peak / 32768.0):.0f}")
+        return f"profile(dBFS/s)=[{','.join(cells)}]"
+
+    def first_loud_summary(self) -> str:
+        """When the first speech-like frame landed, as `first_loud=+2.4s`."""
+        if self.first_loud_at_ms is None:
+            return "first_loud=none"
+        return f"first_loud=+{self.first_loud_at_ms / 1000.0:.1f}s"
+
     def level_summary(self) -> str:
         """Human-readable level line for the logs.
 
         e.g. the cut-off log tail `level peak=1234 (-28.5 dBFS) rms=210
-        (-43.9 dBFS) loud=840ms/10000ms`
+        (-43.9 dBFS) loud=840ms/10000ms profile(dBFS/s)=[-inf,-28] first_loud=+1.0s`
         """
         rms = self.rms()
         return (
             f"peak={self.peak} ({_dbfs(self.peak)} dBFS) "
             f"rms={rms:.0f} ({_dbfs(rms)} dBFS) "
-            f"loud={self.loud_ms:.0f}ms/{self.audio_ms:.0f}ms"
+            f"loud={self.loud_ms:.0f}ms/{self.audio_ms:.0f}ms "
+            f"{self.profile_summary()} {self.first_loud_summary()}"
         )
 
     def speaking_recently(self) -> bool:

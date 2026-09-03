@@ -1,5 +1,5 @@
 name: OpenAI Realtime 2 Voice Agent
-version: "0.7.7"
+version: "0.7.8"
 slug: openai_realtime_voice_agent
 # 980labsOS #1141: prebuilt aarch64 image, so the Pi PULLS instead of building
 # pipecat from source (the local build ran >2h on the Pi and starved HA's API).

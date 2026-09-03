@@ -2,6 +2,26 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.7.8
+
+- **The follow-up window now logs WHEN the speech landed, not just how much.**
+  2026-09-02 23:02: the wake turn read `🎚️ VAD speech_started — level so far:
+  peak=29172 (-1.0 dBFS) rms=5196 loud=560ms/1280ms`, and the follow-up window
+  ten seconds later read `🧽 follow-up cut-off → input_audio_buffer.clear (...
+  only 0 ms of speech; level peak=3541 (-19.3 dBFS) rms=494 (-36.4 dBFS)
+  loud=2896ms/9984ms)`. A ~3 s sentence WAS spoken into that window; it arrived
+  18 dB below the wake turn and OpenAI's VAD never fired. (On the working 21:38
+  run the window peaked at -1.1 dBFS.) The suspicion is that the puck's XMOS
+  echo canceller attenuates near-end speech for a while after the speaker plays
+  — the reply, then the follow-up chime — so WHEN in the window the user speaks
+  decides whether they are heard at all. Totals cannot answer that.
+  `InputBufferTracker` now keeps a per-second peak profile since the last reset
+  (bucketed by accumulated audio_ms, so it is deterministic and testable) and
+  the offset of the first speech-like frame, and appends both to every existing
+  level line — cut-off reasons, `VAD speech_started`, reset debug:
+  `... loud=2896ms/9984ms profile(dBFS/s)=[-37,-36,-19,-20,-21,-35,-36,-36,-36,-36]
+  first_loud=+2.4s`. Diagnostic only; no behaviour change.
+
 ## 0.7.7
 
 - **A stuck "the user is still speaking" flag, unstuck at the bot-reply
