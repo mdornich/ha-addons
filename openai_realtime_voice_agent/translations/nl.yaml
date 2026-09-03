@@ -250,3 +250,10 @@ configuration:
     description: >-
       Slaat microfoon- en speakeraudio op in bestanden binnen de add-on,
       alleen voor probleemanalyse. Normaal uit laten.
+  debug_record_followup:
+    name: "🔍 Debug · Vervolgvenster opnemen"
+    description: >-
+      Slaat de microfoonaudio van elk vervolgvenster op als WAV in je Home
+      Assistant-config onder www/trixie-debug/, zodat je het kunt beluisteren
+      via http://<jouw-ha>/local/trixie-debug/. Bewaart de 6 nieuwste
+      bestanden. Alleen voor probleemanalyse — normaal uit laten.

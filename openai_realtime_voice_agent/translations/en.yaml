@@ -251,3 +251,10 @@ configuration:
     description: >-
       Saves microphone and speaker audio to files inside the add-on, for
       troubleshooting only. Leave off normally.
+  debug_record_followup:
+    name: "🔍 Debug · Record the follow-up window"
+    description: >-
+      Saves the microphone audio of each follow-up window as a WAV in your
+      Home Assistant config under www/trixie-debug/, so you can listen to it
+      at http://<your-ha>/local/trixie-debug/. Keeps the 6 newest files.
+      Troubleshooting only — leave off normally.

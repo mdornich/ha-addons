@@ -457,6 +457,13 @@ class Application:
 
         # Get recording setting (optional, defaults to false)
         enable_recording = os.environ.get("ENABLE_RECORDING", "false").lower() == "true"
+        # Debug aid (0.7.9): capture each follow-up window's mic audio to a WAV
+        # under HA's www/ so it can be fetched at /local/trixie-debug/... .
+        # Added after the 2026-09-02 23:37 cut-off, where the level line showed
+        # 10 s of speech-level mic with no VAD event and no way to tell echo
+        # from room noise from garbled PCM without hearing it.
+        debug_record_followup = (
+            os.environ.get("DEBUG_RECORD_FOLLOWUP", "false").lower() == "true")
         
         # Post-reply follow-up window: how many seconds the device keeps the mic
         # open after the assistant finishes so the user can answer back without
@@ -568,6 +575,7 @@ class Application:
             wake_open_delay_ms=wake_open_delay_ms,
             playback_prebuffer_ms=playback_prebuffer_ms,
             follow_up_max_turns=follow_up_max_turns,
+            debug_record_followup=debug_record_followup,
         )
         logger.info(
             f"🔁 Follow-up window: {follow_up_listen_seconds}s "

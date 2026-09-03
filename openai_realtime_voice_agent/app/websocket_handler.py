@@ -22,6 +22,7 @@ from app.session_manager import SessionManager
 from app.audio_recording_service import AudioRecordingService
 from app.phase_emitter import PhaseEmitter
 from app.input_buffer import InputBufferTracker
+from app.window_recorder import FollowUpWindowRecorder
 from app.follow_up import FollowUpChain, handle_follow_up_cutoff
 from app.transcript_logger import TranscriptLogger
 
@@ -189,13 +190,16 @@ class ConnectionRecovery(FrameProcessor):
     WEDGE_FAILURES = 3
 
     def __init__(self, openai_service, emit_idle=None, phase_emitter=None,
-                 input_buffer=None, **kwargs):
+                 input_buffer=None, window_recorder=None, **kwargs):
         super().__init__(**kwargs)
         self._service = openai_service
         # Counts speech-since-last-commit for the follow-up cut-off decision
         # (app/input_buffer.py). This processor is the only place every mic
         # frame is already in hand, at the DEVICE's rate, before the resampler.
         self._input_buffer = input_buffer
+        # Optional debug tap (app/window_recorder.py): same frames, same place,
+        # writes the follow-up window to a WAV when the option is on.
+        self._window_recorder = window_recorder
         self._emit_idle = emit_idle  # async callable(value:str), e.g. broadcast_phase
         # Preferred idle route: PhaseEmitter.force_idle() keeps the emitter's
         # phase state consistent AND suppresses the racing `thinking` from VAD
@@ -236,6 +240,8 @@ class ConnectionRecovery(FrameProcessor):
                 self._input_buffer.note_audio(
                     len(frame.audio), frame.sample_rate, frame.audio
                 )
+            if self._window_recorder is not None:
+                self._window_recorder.note_audio(frame.audio, frame.sample_rate)
             # Also kept for the proactive-refresh "is anyone interacting?" check.
             # (Stale-audio clearing is now done at the cut-off source — the device
             # sends {"type":"flush"} when a follow-up window times out — not
@@ -428,6 +434,7 @@ class WebSocketHandler:
         wake_open_delay_ms: int = 700,
         playback_prebuffer_ms: int = 0,
         follow_up_max_turns: int = 0,
+        debug_record_followup: bool = False,
     ):
         """
         Initialize WebSocket handler.
@@ -450,6 +457,10 @@ class WebSocketHandler:
                 may chain before the follow-up window stops reopening and the
                 device falls back to wake-word-only. 0 = unlimited (pre-0.7.2
                 behaviour, which let ambient speech keep the mic open forever).
+            debug_record_followup: Write each follow-up window's mic audio to
+                <config>/www/trixie-debug/ as a WAV, fetchable at
+                http://<ha>/local/trixie-debug/. Diagnostic only; off by
+                default. See app/window_recorder.py.
         """
         self.host = host
         self.port = port
@@ -460,6 +471,7 @@ class WebSocketHandler:
         self.wake_open_delay_ms = max(0, int(wake_open_delay_ms))
         self.playback_prebuffer_ms = max(0, int(playback_prebuffer_ms))
         self.follow_up_max_turns = max(0, int(follow_up_max_turns))
+        self.debug_record_followup = bool(debug_record_followup)
         # The window length the DEVICE currently believes in. Diverges from
         # self.follow_up_ms only while a chain cap has closed the window; the
         # next wake restores it. Reset on every connect, because the `hello`
@@ -570,6 +582,12 @@ class WebSocketHandler:
         # Speech-since-last-commit, for the follow-up cut-off (see the handler
         # `_on_device_mic_flush` below and app/input_buffer.py).
         input_buffer = InputBufferTracker()
+        # Debug aid, off unless `debug_record_followup` is on: the mic audio of
+        # each follow-up window, written to <config>/www/trixie-debug/ so it can
+        # be fetched at http://<ha>/local/trixie-debug/... (there is no shell on
+        # the HA host). See app/window_recorder.py.
+        window_recorder = FollowUpWindowRecorder(
+            enabled=self.debug_record_followup)
 
         pipeline_components = [
             transport.input(),
@@ -577,7 +595,8 @@ class WebSocketHandler:
             # to the task source, so place this upstream of the service) and
             # reconnect in place. Without it a 1011/1001 drop bricks the session.
             ConnectionRecovery(openai_service=openai_service, emit_idle=self.broadcast_phase,
-                               phase_emitter=phase_emitter, input_buffer=input_buffer),
+                               phase_emitter=phase_emitter, input_buffer=input_buffer,
+                               window_recorder=window_recorder),
             InputResampler(out_rate=PIPELINE_SAMPLE_RATE),
             input_activity_tracker,
         ]
@@ -719,6 +738,7 @@ class WebSocketHandler:
             try:
                 await openai_service.send_client_event(openai_rt_events.InputAudioBufferClearEvent())
                 input_buffer.note_clear("device interrupt")
+                window_recorder.disarm()
                 logger.info("🛑 device interrupt → input_audio_buffer.clear sent (drop in-flight user audio)")
             except Exception as e:
                 logger.info(f"🛑 device interrupt → input_audio_buffer.clear no-op ({e!r})")
@@ -784,6 +804,7 @@ class WebSocketHandler:
                 openai_service=openai_service,
                 input_buffer=input_buffer,
                 phase_emitter=phase_emitter,
+                window_recorder=window_recorder,
             )
 
         async def _on_device_wake():
@@ -795,6 +816,8 @@ class WebSocketHandler:
             phase_emitter.note_wake()
             # Fresh turn: whatever the counters held belongs to the last one.
             input_buffer.note_clear("device wake")
+            # A wake turn, not a follow-up window: nothing to record.
+            window_recorder.disarm()
             # A wake restarts the follow-up chain (note_wake reset the counter);
             # re-open the window if a previous chain cap had closed it.
             await self.set_device_follow_up_ms(self.follow_up_ms)
@@ -834,6 +857,9 @@ class WebSocketHandler:
             # `speaking` flag an emulated-VAD turn can otherwise leave stuck —
             # see app/input_buffer.py:note_bot_started (2026-09-02 21:38).
             input_buffer.note_bot_started()
+            # The reply is playing; the mic frames that follow are the
+            # follow-up window. That is the audio worth capturing.
+            window_recorder.arm()
 
         phase_emitter.set_kill_window_handlers(
             on_dangling=lambda: _interrupt_kill_until.__setitem__(

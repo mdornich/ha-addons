@@ -141,6 +141,7 @@ option has plain-language inline help.
 | `max_context_messages` | `12` | bounds per-turn token cost |
 | `enable_web_search` | `true` | online lookups; set `false` to disable |
 | `web_search_model` | `gpt-5.5` | best-quality search model; mini/nano are cheaper |
+| `debug_record_followup` | `false` | 🔍 Debug: saves each follow-up window's mic audio to `<config>/www/trixie-debug/`; listen at `http://<your-ha>/local/trixie-debug/followup-<stamp>.wav` (6 newest kept, 30 s each). Troubleshooting only. |
 
 The legacy `server_vad` turn-detection fields live at the bottom of ⚙️ Advanced and
 only appear when you enable **"Show unused optional configuration options"** —

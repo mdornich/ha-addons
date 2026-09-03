@@ -1,5 +1,5 @@
 name: OpenAI Realtime 2 Voice Agent
-version: "0.7.8"
+version: "0.7.9"
 slug: openai_realtime_voice_agent
 # 980labsOS #1141: prebuilt aarch64 image, so the Pi PULLS instead of building
 # pipecat from source (the local build ran >2h on the Pi and starved HA's API).
@@ -20,6 +20,13 @@ host_network: true
 # authenticates the `house` tool's websocket to ws://supervisor/core/websocket
 # (assist_pipeline/run); longlived_token stays as an override.
 homeassistant_api: true
+# Read/write access to HA's config directory (mounted at /homeassistant inside
+# the container; older Supervisor builds use /config — app/window_recorder.py
+# detects which). Needed ONLY by the `debug_record_followup` aid, which writes
+# WAVs to <config>/www/trixie-debug/ so they can be fetched at
+# http://<ha>/local/trixie-debug/ — there is no shell on the HA host.
+map:
+  - homeassistant_config:rw
 
 # ----------------------------------------------------------------------------
 # Options are ORDERED for the Configuration tab (HA renders them in this order)
@@ -139,6 +146,13 @@ options:
 
   # --- 🔍 Debug ---
   enable_recording: false
+  # 0.7.9: writes each follow-up window's mic audio to
+  # <config>/www/trixie-debug/followup-<stamp>.wav (fetch at
+  # /local/trixie-debug/...). Added after the 2026-09-02 23:37 cut-off, whose
+  # level line showed 10 s of speech-level mic with no VAD event — echo, room
+  # noise and garbled PCM all look identical in the numbers. Keeps the 6 newest
+  # files, 30 s each. Diagnostic only; leave off.
+  debug_record_followup: false
 
 schema:
   # --- 🔑 Basics ---
@@ -188,6 +202,7 @@ schema:
   vad_silence_duration_ms: int?
   # --- 🔍 Debug ---
   enable_recording: bool
+  debug_record_followup: bool
 # `image:` is set at the top of this file (980labsOS #1141) -> the Supervisor
 # PULLS the prebuilt image instead of building from the Dockerfile in this
 # directory. The Dockerfile + build.yaml are kept as the build recipe: rebuild

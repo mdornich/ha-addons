@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
 COMMIT_ACK_TIMEOUT_S = 1.5
 
 
-async def handle_follow_up_cutoff(openai_service, input_buffer, phase_emitter) -> bool:
+async def handle_follow_up_cutoff(
+    openai_service, input_buffer, phase_emitter, window_recorder=None
+) -> bool:
     """Commit-or-clear on `{"type":"flush"}` from the device.
 
     Two very different situations arrive on that one message, and add-on 0.7.0
@@ -45,6 +47,15 @@ async def handle_follow_up_cutoff(openai_service, input_buffer, phase_emitter) -
     clear, because no turn is in flight.
     """
     decision = input_buffer.decide_cutoff()
+    # The window is over either way, so this is the one place both branches
+    # share: write the debug WAV (when `debug_record_followup` is on) before
+    # anything is committed or cleared. See app/window_recorder.py for the
+    # 2026-09-02 23:37 line this exists to explain.
+    if window_recorder is not None:
+        try:
+            window_recorder.finalize("commit" if decision.commit else "clear")
+        except Exception as e:  # never let a debug aid break the turn
+            logger.warning(f"⚠️ follow-up window recording failed ({e!r})")
     if decision.commit:
         try:
             outcome = None

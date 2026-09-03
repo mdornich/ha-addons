@@ -2,6 +2,24 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.7.9
+
+- **The follow-up window's mic audio can now be recorded and listened to.**
+  2026-09-02 23:37 the window cut off with `level peak=19926 (-4.3 dBFS)
+  rms=1288 (-28.1 dBFS) loud=10000ms/10000ms
+  profile(dBFS/s)=[-16,-15,-16,-15,-11,-16,-14,-13,-14,-4] first_loud=+0.0s`
+  and OpenAI's VAD never fired once: the mic sat at speech level from the very
+  first frame for all ten seconds. The puck's own reply leaking back, room
+  noise, and garbled PCM are indistinguishable in those numbers — the only way
+  to settle it is to hear the audio, and there is no shell on the HA host. New
+  option `debug_record_followup` (🔍 Debug, off by default) writes each
+  follow-up window's device-rate PCM16 mono mic feed to
+  `<config>/www/trixie-debug/followup-<YYYYmmdd-HHMMSS>.wav`, which HA serves
+  at `http://<your-ha>/local/trixie-debug/followup-....wav`. Armed only after a
+  bot reply (never the wake turn), finalised by the cut-off handler, capped at
+  30 s per file with the 6 newest kept. Requires the new
+  `map: homeassistant_config:rw`. Diagnostic only; no behaviour change.
+
 ## 0.7.8
 
 - **The follow-up window now logs WHEN the speech landed, not just how much.**
