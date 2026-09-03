@@ -856,17 +856,11 @@ class Application:
             logger.info("✅ New OpenAI Session created")
             return self.openai_service
     
-    async def run(self) -> None:
-        """Run the application."""
-        await self.initialize()
-        
-        # Create initial OpenAI service (will be replaced per connection)
-        await self._ensure_openai_service()
-        
-        # Build pipeline - based on pipecat-examples, one pipeline handles all connections
-        # The transport manages multiple connections internally
-        self._build_pipeline_for_transport(self.websocket_transport, "server")
+    def _preseed_startup_context(self) -> None:
+        """Pre-seed an empty LLMContext (and pipecat's conversation-setup flag).
 
+        Extracted from run() so the gate below is directly testable.
+        """
         # Consume pipecat's FIRST-context auto-response ONCE at startup — SILENTLY.
         # WHY: pipecat 0.0.97's OpenAIRealtimeLLMService._handle_context does
         # `if not self._context: ... await self._create_response()` — i.e. the
@@ -890,17 +884,27 @@ class Application:
         # The empty sentinel is harmlessly overwritten by the real context on the
         # first turn (both branches do `self._context = context`).
         #
-        # The context pre-seed itself now runs for EVERY turn-detection mode, not
+        # The context pre-seed itself runs for EVERY turn-detection mode, not
         # just semantic_vad: a None `_context` is also the thing that made
         # pipecat's reset_conversation() raise mid-reconnect and wedge the session
-        # permanently (see SafeRealtimeLLMService.reset_conversation above). Under
-        # server_vad the sentinel is equally harmless — `create_response` is left
-        # unset there, which OpenAI defaults to true, so the server still creates
-        # turn 1's response. Only the `_llm_needs_conversation_setup = False` part
-        # stays gated on semantic_vad + create_response, exactly as before.
+        # permanently (see SafeRealtimeLLMService.reset_conversation above).
+        #
+        # The setup-flag clear now runs under server_vad too (0.7.10). The old
+        # gating (semantic_vad + create_response only) was reasoning about who
+        # creates the response: under semantic_vad that is explicit
+        # (`create_response`), so the gate mirrored it. Under server_vad
+        # pipecat 0.0.97's `TurnDetection` event model carries no
+        # `create_response` field at all, so OpenAI's server default (true)
+        # applies — the SERVER creates every user-turn response there as well,
+        # and the add-on never needs pipecat's one-time setup+create. Leaving
+        # the flag set under server_vad meant pipecat ran its "conversation
+        # setup" on the first `_create_response`, re-sending context items
+        # OpenAI already had, and the first wake turn came back as filler
+        # (2026-09-03 11:02: house tool returned the forecast in 108 ms, the
+        # assistant said "Ready when you are.").
         _seed_setup_flag = (
             self.turn_detection_type == "semantic_vad" and self.semantic_vad_create_response
-        )
+        ) or self.turn_detection_type == "server_vad"
         try:
             from pipecat.processors.aggregators.llm_context import LLMContext
             if self.openai_service is not None and getattr(self.openai_service, "_context", None) is None:
@@ -916,16 +920,34 @@ class Application:
                 # klaar om verder te gaan met het gesprek."). Instructions are
                 # sent independently via _update_settings() on session.created,
                 # so clearing this flag is safe and makes the first real turn a
-                # normal reply. Kept gated on semantic_vad + create_response.
+                # normal reply. Applies to semantic_vad + create_response and to
+                # server_vad (where OpenAI's create_response default is true).
                 if _seed_setup_flag and hasattr(self.openai_service, "_llm_needs_conversation_setup"):
                     self.openai_service._llm_needs_conversation_setup = False
-                    logger.info("🌱 Pre-seeded empty context + marked conversation setup done (no startup speech, no first-turn filler)")
+                    logger.info(
+                        "🌱 Pre-seeded empty context + marked conversation setup done "
+                        f"(turn_detection={self.turn_detection_type}; server creates turn responses — "
+                        "no startup speech, no first-turn filler)"
+                    )
                 else:
                     logger.info("🌱 Pre-seeded empty context (reconnect-safe sentinel; conversation-setup flag left as-is)")
             else:
                 logger.info("🌱 Startup context already set; skipping pre-seed")
         except Exception as e:
             logger.warning(f"⚠️ Could not pre-seed startup context (turn-1 double may occur): {e}")
+
+    async def run(self) -> None:
+        """Run the application."""
+        await self.initialize()
+        
+        # Create initial OpenAI service (will be replaced per connection)
+        await self._ensure_openai_service()
+        
+        # Build pipeline - based on pipecat-examples, one pipeline handles all connections
+        # The transport manages multiple connections internally
+        self._build_pipeline_for_transport(self.websocket_transport, "server")
+
+        self._preseed_startup_context()
 
         # Setup WebSocket event handlers
         async def on_client_connected(client_id: str):

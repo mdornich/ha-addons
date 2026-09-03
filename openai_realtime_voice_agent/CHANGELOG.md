@@ -2,6 +2,25 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.7.10
+
+- **First wake turn after a fresh session no longer answers with filler.**
+  2026-09-03 11:02 (0.7.9, `turn_detection_type=server_vad`): user asked "Is it
+  gonna rain today?", the house tool returned the full forecast in 108 ms, and
+  the assistant said "Ready when you are." — the tool result was ignored. Turns
+  2 and 3 were correct. The startup pre-seed exists to prevent exactly this,
+  but its `_llm_needs_conversation_setup = False` clear was gated on
+  `semantic_vad` + `create_response`, so under server_vad pipecat still ran its
+  one-time "conversation setup" on the first `_create_response`, re-sending
+  context items OpenAI already had. Under server_vad OpenAI's
+  `turn_detection.create_response` defaults to true (pipecat 0.0.97's
+  `TurnDetection` model carries no such field, so the server default applies),
+  so the server creates every user-turn response and the add-on never needs
+  pipecat's setup+create. The clear now runs for server_vad as well. The
+  pre-seed block moved out of `run()` into `Application._preseed_startup_context()`
+  so the gate is directly testable; `SafeRealtimeLLMService.reset_conversation`
+  already cleared the flag unconditionally and is unchanged.
+
 ## 0.7.9
 
 - **The follow-up window's mic audio can now be recorded and listened to.**
